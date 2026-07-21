@@ -24,6 +24,8 @@ from fla.utils.ascend_ub_manager import (
 
 _NUM_WARPS = 4
 _BC = 16
+# Forward uses a larger BC: fewer triangular sub-tiles and a fused inter+intra kernel.
+_FWD_BC = 32
 _O_MEM_MULT = 6.0
 _SAFETY_MARGIN = 0.80
 _FALLBACK_BK = 16
@@ -32,9 +34,9 @@ _MAX_BK = 64
 _MAX_BV = 64
 
 
-def _get_bk(K: int) -> int:
+def _get_bk(K: int, bc: int = _BC) -> int:
     return compute_row_tile_block_size(
-        _BC,
+        bc,
         K,
         _O_MEM_MULT,
         tiling_row=False,
@@ -45,9 +47,9 @@ def _get_bk(K: int) -> int:
     )
 
 
-def _get_bv(V: int) -> int:
+def _get_bv(V: int, bc: int = _BC) -> int:
     return compute_row_tile_block_size(
-        _BC,
+        bc,
         V,
         _O_MEM_MULT,
         tiling_row=False,
@@ -56,6 +58,14 @@ def _get_bv(V: int) -> int:
         min_block=16,
         max_block=min(_MAX_BV, triton.next_power_of_2(V)),
     )
+
+
+def _fwd_bc(chunk_size: int) -> int:
+    """Largest power-of-two BC <= _FWD_BC that divides chunk_size."""
+    bc = min(_FWD_BC, chunk_size)
+    while bc > 1 and chunk_size % bc != 0:
+        bc //= 2
+    return max(bc, 1)
 
 
 def _launch_fwd_o_kernel(kernel, *, nv: int, nt: int, bh_total: int, kernel_kwargs: dict) -> None:
@@ -149,11 +159,14 @@ def chunk_fwd_kernel_o_inter_npu(
         if USE_G:
             p_gs = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc_s,), (BC,), (0,))
             b_gs = tl.load(p_gs, boundary_check=(0,))
-            b_o = b_o * exp2(b_gs)[:, None]
         if USE_G_GAMMA:
             b_gamma = tl.load(g_gamma + i_h)
             b_gs = b_gamma * (s * BC + o_i + 1).to(tl.float32)
-            b_o = b_o * exp2(b_gs)[:, None]
+        if USE_G or USE_G_GAMMA:
+            # Factor exp2(gs - gc) into row/column vectors. Computing exp2 on
+            # the broadcast BC x BC difference made the fused kernel vector-bound.
+            b_egs = exp2(b_gs)
+            b_o = b_o * b_egs[:, None]
 
         b_o = b_o * scale
         p_o = tl.make_block_ptr(o, (T, V), (HV * V, 1), (i_tc_s, i_v * BV), (BC, BV), (1, 0))
@@ -161,7 +174,7 @@ def chunk_fwd_kernel_o_inter_npu(
 
 
 @triton.jit(do_not_specialize=['T'])
-def chunk_fwd_kernel_o_fused_hv1_npu(
+def chunk_fwd_kernel_o_fused_npu(
     q,
     k,
     v,
@@ -178,6 +191,7 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
+    BC: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
@@ -188,7 +202,7 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     NT_OFFSET: tl.constexpr,
     BH_OFFSET: tl.constexpr,
 ):
-    """Full-BT fused inter+intra path for HV==1."""
+    """BC-tiled fused inter+intra forward. Peak live ~ BC*BV + BC*BC + q/k/h/v tiles."""
     i_v = tl.program_id(0) + V_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
     i_bh = tl.program_id(2) + BH_OFFSET
@@ -211,47 +225,72 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     o += (bos * HV + i_h) * V
     h += (i_tg * HV + i_h).to(tl.int64) * K * V
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    o_i = tl.arange(0, BC)
+    n_sub = BT // BC
 
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        if STATE_V_FIRST:
-            p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
-        else:
-            p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-        if STATE_V_FIRST:
-            b_o += tl.dot(b_q, tl.trans(b_h), allow_tf32=False)
-        else:
-            b_o += tl.dot(b_q, b_h, allow_tf32=False)
-        b_A += tl.dot(b_q, b_k, allow_tf32=False)
+    for s in range(n_sub):
+        i_tc_s = i_t * BT + s * BC
+        m_s = (i_tc_s + o_i) < T
+        b_o = tl.zeros([BC, BV], dtype=tl.float32)
 
-    if USE_G:
-        g += bos * HV + i_h
-        p_g = tl.make_block_ptr(g, (T,), (HV,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-        b_o = b_o * exp2(b_g)[:, None]
-        b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
-    if USE_G_GAMMA:
-        b_gamma = tl.load(g_gamma + i_h)
-        b_g = b_gamma * (tl.arange(0, BT) + 1)
-        b_o = b_o * exp2(b_g)[:, None]
-        b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+        for i_k in range(tl.cdiv(K, BK)):
+            p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc_s, i_k * BK), (BC, BK), (1, 0))
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+                b_h = tl.load(p_h, boundary_check=(0, 1))
+                b_o += tl.dot(b_q, tl.trans(b_h), allow_tf32=False)
+            else:
+                p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
+                b_h = tl.load(p_h, boundary_check=(0, 1))
+                b_o += tl.dot(b_q, b_h, allow_tf32=False)
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A, 0)
+        if USE_G:
+            p_gs = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc_s,), (BC,), (0,))
+            b_gs = tl.load(p_gs, boundary_check=(0,))
+            b_o = b_o * exp2(b_gs)[:, None]
+        if USE_G_GAMMA:
+            b_gamma = tl.load(g_gamma + i_h)
+            b_gs = b_gamma * (s * BC + o_i + 1).to(tl.float32)
+            b_o = b_o * exp2(b_gs)[:, None]
 
-    p_v = tl.make_block_ptr(v, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    p_o = tl.make_block_ptr(o, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v, allow_tf32=False) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        for c in range(s + 1):
+            i_tc_c = i_t * BT + c * BC
+            m_c = (i_tc_c + o_i) < T
+            b_A = tl.zeros([BC, BC], dtype=tl.float32)
+            b_gc = tl.zeros([BC], dtype=tl.float32)
+            for i_k in range(tl.cdiv(K, BK)):
+                p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc_s, i_k * BK), (BC, BK), (1, 0))
+                p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc_c, i_k * BK), (BC, BK), (1, 0))
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_A += tl.dot(b_q, tl.trans(b_k), allow_tf32=False)
+
+            if USE_G:
+                p_gc = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_tc_c,), (BC,), (0,))
+                b_gc = tl.load(p_gc, boundary_check=(0,))
+            if USE_G_GAMMA:
+                b_gc = b_gamma * (c * BC + o_i + 1).to(tl.float32)
+
+            # Mask before exp2: OOB g loads as 0 via boundary_check, so
+            # exp2(gs - gc) can overflow (0 - large_negative). Also avoid
+            # exp2(gs)/exp2(gc) which becomes 0/0 once gates underflow.
+            if s == c:
+                m_blk = (o_i[:, None] >= o_i[None, :]) & (m_s[:, None] & m_s)
+            else:
+                m_blk = m_s[:, None] & m_c
+            if USE_G or USE_G_GAMMA:
+                b_A = tl.where(m_blk, b_A * exp2(b_gs[:, None] - b_gc[None, :]), 0)
+            else:
+                b_A = tl.where(m_blk, b_A, 0)
+
+            p_v = tl.make_block_ptr(v, (T, V), (HV * V, 1), (i_tc_c, i_v * BV), (BC, BV), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_o += tl.dot(b_A.to(b_v.dtype), b_v, allow_tf32=False)
+
+        b_o = b_o * scale
+        p_o = tl.make_block_ptr(o, (T, V), (HV * V, 1), (i_tc_s, i_v * BV), (BC, BV), (1, 0))
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit(do_not_specialize=['T'])
@@ -453,62 +492,65 @@ def chunk_fwd_o_npu(
         scale = k.shape[-1] ** -0.5
 
     o = torch.empty_like(v)
-    BK = _get_bk(K)
-    BV = _get_bv(V)
+    BC = _fwd_bc(BT)
+    BK = _get_bk(K, bc=BC)
+    BV = _get_bv(V, bc=BC)
     use_g = g is not None
     use_g_gamma = g_gamma is not None
     g_arg = g if use_g else q
-    base_kwargs = {
-        'g': g_arg,
-        'g_gamma': g_gamma,
-        'cu_seqlens': cu_seqlens,
-        'chunk_indices': chunk_indices,
-        'scale': scale,
-        'T': T,
-        'H': H,
-        'HV': HV,
-        'K': K,
-        'V': V,
-        'BT': BT,
-        'BC': _BC,
-        'BK': BK,
-        'BV': BV,
-        'USE_G': use_g,
-        'USE_G_GAMMA': use_g_gamma,
-        'IS_VARLEN': cu_seqlens is not None,
-        'V_OFFSET': 0,
-        'NT_OFFSET': 0,
-        'BH_OFFSET': 0,
-    }
-    nv = triton.cdiv(V, BV)
-    # Identity gate (exp2(0)=1) when g is disabled.
+    # Identity gate (exp2(0)=1): Ascend path is more reliable with an explicit USE_G tile
+    # than with a fully gate-free compile variant.
     if not use_g and not use_g_gamma:
         g_arg = torch.zeros(B, T, HV, dtype=torch.float32, device=q.device)
         use_g = True
-    base_kwargs['g'] = g_arg
-    base_kwargs['USE_G'] = use_g
+    nv = triton.cdiv(V, BV)
+    # HV==1: full-BT intra fits UB and is faster than BC-tiled triangular.
     if HV == 1:
+        BK1 = _get_bk(K, bc=_BC)
+        BV1 = _get_bv(V, bc=_BC)
+        nv1 = triton.cdiv(V, BV1)
+        base = {
+            'g': g_arg,
+            'g_gamma': g_gamma,
+            'cu_seqlens': cu_seqlens,
+            'chunk_indices': chunk_indices,
+            'scale': scale,
+            'T': T,
+            'H': H,
+            'HV': HV,
+            'K': K,
+            'V': V,
+            'BT': BT,
+            'BK': BK1,
+            'BV': BV1,
+            'USE_G': use_g,
+            'USE_G_GAMMA': use_g_gamma,
+            'IS_VARLEN': cu_seqlens is not None,
+            'V_OFFSET': 0,
+            'NT_OFFSET': 0,
+            'BH_OFFSET': 0,
+        }
         _launch_fwd_o_kernel(
             chunk_fwd_kernel_o_inter_npu,
-            nv=nv,
+            nv=nv1,
             nt=NT,
             bh_total=B * HV,
             kernel_kwargs={
-                **base_kwargs,
+                **base,
+                'BC': _BC,
                 'q': q,
                 'h': h,
                 'o': o,
                 'STATE_V_FIRST': state_v_first,
             },
         )
-        intra_hv1_kwargs = {k: v for k, v in base_kwargs.items() if k != 'BC'}
         _launch_fwd_o_kernel(
             chunk_fwd_kernel_o_intra_hv1_npu,
-            nv=nv,
+            nv=nv1,
             nt=NT,
             bh_total=B * HV,
             kernel_kwargs={
-                **intra_hv1_kwargs,
+                **base,
                 'q': q,
                 'k': k,
                 'v': v,
@@ -518,30 +560,37 @@ def chunk_fwd_o_npu(
         )
         return o
     _launch_fwd_o_kernel(
-        chunk_fwd_kernel_o_inter_npu,
+        chunk_fwd_kernel_o_fused_npu,
         nv=nv,
         nt=NT,
         bh_total=B * HV,
         kernel_kwargs={
-            **base_kwargs,
-            'q': q,
-            'h': h,
-            'o': o,
-            'STATE_V_FIRST': state_v_first,
-        },
-    )
-    _launch_fwd_o_kernel(
-        chunk_fwd_kernel_o_intra_npu,
-        nv=nv,
-        nt=NT,
-        bh_total=B * HV,
-        kernel_kwargs={
-            **base_kwargs,
             'q': q,
             'k': k,
             'v': v,
+            'h': h,
+            'g': g_arg,
+            'g_gamma': g_gamma,
             'o': o,
-            'ACCUMULATE_OUTPUT': True,
+            'cu_seqlens': cu_seqlens,
+            'chunk_indices': chunk_indices,
+            'scale': scale,
+            'T': T,
+            'H': H,
+            'HV': HV,
+            'K': K,
+            'V': V,
+            'BT': BT,
+            'BC': BC,
+            'BK': BK,
+            'BV': BV,
+            'USE_G': use_g,
+            'USE_G_GAMMA': use_g_gamma,
+            'STATE_V_FIRST': state_v_first,
+            'IS_VARLEN': cu_seqlens is not None,
+            'V_OFFSET': 0,
+            'NT_OFFSET': 0,
+            'BH_OFFSET': 0,
         },
     )
     return o
