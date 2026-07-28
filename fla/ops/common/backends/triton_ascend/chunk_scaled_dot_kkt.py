@@ -31,9 +31,16 @@ _FALLBACK_BK = 8
 _MAX_BK = 64
 
 
-def _get_bk(K: int) -> int:
+def _hv_t_npu_arg(x: torch.Tensor | None, HV: int) -> tuple[torch.Tensor | None, bool]:
+    """Transpose to [B, HV, T] when HV>1 for contiguous token-axis loads."""
+    if x is None or HV == 1:
+        return x, False
+    return x.transpose(1, 2).contiguous(), True
+
+
+def _get_bk(BC: int, K: int) -> int:
     return compute_row_tile_block_size(
-        _BC,
+        BC,
         K,
         _KKT_MEM_MULT,
         tiling_row=False,
@@ -42,6 +49,36 @@ def _get_bk(K: int) -> int:
         min_block=8,
         max_block=min(_MAX_BK, triton.next_power_of_2(K)),
     )
+
+
+def _get_bc(BT: int) -> int:
+    # Avoid 16x16 sub-tiling: column-offset block_ptr stores misalign on NPU.
+    return BT if BT <= 64 else _BC
+
+
+@triton.jit
+def _t_npu_base(
+    tensor,
+    bos,
+    i_b,
+    i_h,
+    T_seq,
+    T_CONTIG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    HV: tl.constexpr,
+):
+    if T_CONTIG:
+        if IS_VARLEN:
+            return tensor + bos + i_h * T_seq
+        return tensor + i_b * HV * T_seq + i_h * T_seq
+    return tensor + bos * HV + i_h
+
+
+@triton.jit
+def _t_block_ptr(base, T, offset, BC, T_CONTIG: tl.constexpr, HV: tl.constexpr):
+    if T_CONTIG:
+        return tl.make_block_ptr(base, (T,), (1,), (offset,), (BC,), (0,))
+    return tl.make_block_ptr(base, (T,), (HV,), (offset,), (BC,), (0,))
 
 
 def _launch_kkt_kernel(kernel, *, NT: int, bh_total: int, kernel_kwargs: dict) -> None:
@@ -71,6 +108,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     cu_seqlens,
     chunk_indices,
     T,
+    T_seq,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -79,6 +117,8 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    G_T_CONTIG: tl.constexpr,
+    BETA_T_CONTIG: tl.constexpr,
     NT_OFFSET: tl.constexpr,
     BH_OFFSET: tl.constexpr,
 ):
@@ -90,15 +130,16 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
-        bos, eos = i_b * T, i_b * T + T
+        bos = i_b * T
 
     if i_t * BT >= T:
         return
 
     k_base = k + (bos * H + i_h // (HV // H)) * K
     A_base = A + (bos * HV + i_h) * BT
-    beta_base = beta + bos * HV + i_h
-    g_base = g + bos * HV + i_h
+    beta_base = _t_npu_base(beta, bos, i_b, i_h, T_seq, BETA_T_CONTIG, IS_VARLEN, HV)
+    if USE_G:
+        g_base = _t_npu_base(g, bos, i_b, i_h, T_seq, G_T_CONTIG, IS_VARLEN, HV)
 
     o_i = tl.arange(0, BC)
     n_sub = BT // BC
@@ -106,10 +147,10 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     for s in range(n_sub):
         i_tc_s = i_t * BT + s * BC
         m_s = (i_tc_s + o_i) < T
-        p_bs = tl.make_block_ptr(beta_base, (T,), (HV,), (i_tc_s,), (BC,), (0,))
+        p_bs = _t_block_ptr(beta_base, T, i_tc_s, BC, BETA_T_CONTIG, HV)
         b_bs = tl.load(p_bs, boundary_check=(0,))
         if USE_G:
-            p_gs = tl.make_block_ptr(g_base, (T,), (HV,), (i_tc_s,), (BC,), (0,))
+            p_gs = _t_block_ptr(g_base, T, i_tc_s, BC, G_T_CONTIG, HV)
             b_gs = tl.load(p_gs, boundary_check=(0,))
 
         for c in range(s + 1):
@@ -124,16 +165,15 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
                 b_A += tl.dot(b_ks, tl.trans(b_kc), allow_tf32=False)
 
             if USE_G:
-                p_gc = tl.make_block_ptr(g_base, (T,), (HV,), (i_tc_c,), (BC,), (0,))
+                p_gc = _t_block_ptr(g_base, T, i_tc_c, BC, G_T_CONTIG, HV)
                 b_gc = tl.load(p_gc, boundary_check=(0,))
-                b_gdiff = b_gs[:, None] - b_gc[None, :]
-                b_A *= exp2(b_gdiff)
+                b_A *= exp2(b_gs[:, None] - b_gc[None, :])
             b_A *= b_bs[:, None]
 
             if s == c:
-                m_blk = (o_i[:, None] > o_i[None, :]) & (m_s[:, None] & m_s)
+                m_blk = (o_i[:, None] > o_i[None, :]) & (m_s[:, None] & m_s[None, :])
             else:
-                m_blk = m_s[:, None] & m_c
+                m_blk = m_s[:, None] & m_c[None, :]
             b_A = tl.where(m_blk, b_A, 0)
 
             p_A = tl.make_block_ptr(A_base, (T, BT), (HV * BT, 1), (i_tc_s, c * BC), (BC, BC), (1, 0))
@@ -156,29 +196,34 @@ def chunk_scaled_dot_kkt_fwd_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, HV, BT, device=k.device, dtype=output_dtype)
-    BK = _get_bk(K)
+    BC = _get_bc(BT)
+    BK = _get_bk(BC, K)
     use_g = g is not None
-    g_arg = g if use_g else beta
+    g_arg, g_t_contig = _hv_t_npu_arg(g, HV)
+    beta_arg, beta_t_contig = _hv_t_npu_arg(beta, HV)
     _launch_kkt_kernel(
         chunk_scaled_dot_kkt_fwd_kernel_npu,
         NT=NT,
         bh_total=B * HV,
         kernel_kwargs={
             'k': k,
-            'g': g_arg,
-            'beta': beta,
+            'g': g_arg if use_g else beta_arg,
+            'beta': beta_arg,
             'A': A,
             'cu_seqlens': cu_seqlens,
             'chunk_indices': chunk_indices,
             'T': T,
+            'T_seq': T,
             'H': H,
             'HV': HV,
             'K': K,
             'BT': BT,
-            'BC': _BC,
+            'BC': BC,
             'BK': BK,
             'USE_G': use_g,
             'IS_VARLEN': cu_seqlens is not None,
+            'G_T_CONTIG': g_t_contig,
+            'BETA_T_CONTIG': beta_t_contig,
             'NT_OFFSET': 0,
             'BH_OFFSET': 0,
         },
