@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.runtime import driver
 
 from fla.ops.kda.backends.triton_ascend.wy_fast import recompute_w_u_fwd_kda_npu as _recompute_w_u_fwd_npu
 from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
@@ -647,20 +648,23 @@ def chunk_kda_fwd_intra_npu(
     return w, u, qg, kg, Aqk, Akk
 
 
-_NUM_WARPS_BWD = 2
-# Vectorized diagonal path keeps BC×BK tiles live; keep BK small for Ascend UB.
-_BWD_INTRA_MEM_MULT = 18.0
+# Split at debug_barrier: dq/db half has lower peak live set than dk/dg half.
+_BWD_INTRA_DQ_MEM_MULT = 10.0
+_BWD_INTRA_DK_MEM_MULT = 9.0
 _FALLBACK_BK = 16
-_MAX_BK = 16
-# limit programs per launch to stay within Ascend AICore task time.
-_KDA_BWD_INTRA_LAUNCH_BLOCK_BUDGET = 4096
+_MAX_BK = 64
+
+
+def get_npu_properties():
+    device = torch.npu.current_device()
+    return driver.active.utils.get_device_properties(device)
 
 
 def _get_bwd_intra_bk(K: int) -> int:
     return compute_row_tile_block_size(
         _BC,
         K,
-        _BWD_INTRA_MEM_MULT,
+        max(_BWD_INTRA_DQ_MEM_MULT, _BWD_INTRA_DK_MEM_MULT),
         tiling_row=False,
         safety_margin=_SAFETY_MARGIN,
         fallback=_FALLBACK_BK,
@@ -669,293 +673,337 @@ def _get_bwd_intra_bk(K: int) -> int:
     )
 
 
-def _launch_bwd_intra_kernel(
-    kernel,
-    *,
-    nk_nc: int,
-    nt: int,
-    bh_total: int,
-    kernel_kwargs: dict,
-) -> None:
-    # limit programs per launch to stay within Ascend AICore task time.
-    budget = _KDA_BWD_INTRA_LAUNCH_BLOCK_BUDGET
-    chunk_indices = kernel_kwargs.get('chunk_indices')
-    cu_seqlens = kernel_kwargs.get('cu_seqlens')
-    nk_step = nk_nc if nk_nc * nt * bh_total <= budget else max(1, budget // max(nt * bh_total, 1))
-    for nknc_off in range(0, nk_nc, nk_step):
-        nknc_len = min(nk_step, nk_nc - nknc_off)
-        kernel_kwargs['NKNC_OFFSET'] = nknc_off
-        nt_budget = max(1, budget // max(nknc_len * bh_total, 1))
-        max_nt = min(
-            nt_budget,
-            max_grid_axis_chunks(nt, nknc_len * bh_total, max_grid=ASCEND_MAX_GRID_DIM),
-        )
-        for nt_off in range(0, nt, max_nt):
-            nt_len = min(max_nt, nt - nt_off)
-            if cu_seqlens is not None and chunk_indices is not None:
-                kernel_kwargs['chunk_indices'] = chunk_indices[nt_off:nt_off + nt_len]
-                kernel_kwargs['NT_OFFSET'] = 0
-            else:
-                kernel_kwargs['NT_OFFSET'] = nt_off
-            bh_budget = max(1, budget // max(nknc_len * nt_len, 1))
-            max_bh = min(
-                bh_budget,
-                max_grid_axis_chunks(bh_total, nknc_len * nt_len, max_grid=ASCEND_MAX_GRID_DIM),
-            )
-            for bh_off in range(0, bh_total, max_bh):
-                bh_len = min(max_bh, bh_total - bh_off)
-                kernel_kwargs['BH_OFFSET'] = bh_off
-                kernel[(nknc_len, nt_len, bh_len)](num_warps=_NUM_WARPS_BWD, **kernel_kwargs)
+def _launch_bwd_intra_core_grid(kernel, *, task_num: int, kernel_kwargs: dict) -> None:
+    num_core = get_npu_properties()["num_aicore"]
+    kernel[(num_core,)](task_num=task_num, num_core=num_core, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['B', 'T', 'NKNC_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
-def chunk_kda_bwd_kernel_intra_npu(
-    q,
-    k,
-    g,
-    beta,
-    dAqk,
-    dAkk,
-    dq,
-    dq2,
-    dk,
-    dk2,
-    dg,
-    dg2,
-    db,
-    cu_seqlens,
-    chunk_indices,
-    B,
-    T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    SAFE_GATE: tl.constexpr,
-    NKNC_OFFSET,
-    NT_OFFSET,
-    BH_OFFSET,
+def _gk_npu_arg(g: torch.Tensor, HV: int) -> tuple[torch.Tensor, bool]:
+    """Transpose g to [B, HV, T, K] for stride-1 row loads along T."""
+    if HV == 1:
+        return g, False
+    return g.transpose(1, 2).contiguous(), True
+
+
+@triton.jit
+def _bwd_intra_g_base(g, bos, i_b, i_hv, T_seq, K, HV, IS_VARLEN: tl.constexpr, G_T_CONTIG: tl.constexpr):
+    if G_T_CONTIG:
+        if IS_VARLEN:
+            return g + (bos * K).to(tl.int64) + i_hv.to(tl.int64) * T_seq * K
+        return g + (i_b * HV * T_seq * K).to(tl.int64) + i_hv.to(tl.int64) * T_seq * K
+    return g + (bos * HV + i_hv).to(tl.int64) * K
+
+
+@triton.jit
+def _bwd_intra_g_row_stride(G_T_CONTIG: tl.constexpr, HV: tl.constexpr, K: tl.constexpr):
+    if G_T_CONTIG:
+        return K
+    return HV * K
+
+
+@triton.jit
+def _bwd_intra_g_block_ptr(g_base, T, row, col, BC, BK, g_row_stride, K: tl.constexpr):
+    return tl.make_block_ptr(g_base, (T, K), (g_row_stride, 1), (row, col), (BC, BK), (1, 0))
+
+
+@triton.jit(do_not_specialize=['B', 'T', 'NT', 'BH_TOTAL', 'task_num', 'num_core'])
+def chunk_kda_bwd_kernel_intra_dq_db_npu(
+    q, k, g, beta, dAqk, dAkk, dq, dq2, dk_part, dg_part, db,
+    cu_seqlens, chunk_indices, B, T, NT, BH_TOTAL, task_num, num_core,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
+    BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
+    IS_VARLEN: tl.constexpr, SAFE_GATE: tl.constexpr, G_T_CONTIG: tl.constexpr,
 ):
-    i_kc = tl.program_id(0) + NKNC_OFFSET
-    i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
-    i_b, i_hv = i_bh // HV, i_bh % HV
-    i_h = i_hv // (HV // H)
-    i_k, i_i = i_kc // NC, i_kc % NC
+    core_id = tl.program_id(0)
+    g_row_stride = _bwd_intra_g_row_stride(G_T_CONTIG, HV, K)
+    for task_id in tl.range(core_id, task_num, num_core):
+        i_bh = task_id % BH_TOTAL
+        rem = task_id // BH_TOTAL
+        i_t = rem % NT
+        i_k = rem // NT
+        i_b, i_hv = i_bh // HV, i_bh % HV
+        i_h = i_hv // (HV // H)
+        T_seq = T
+        if IS_VARLEN:
+            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        else:
+            bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+        T_cur = (eos - bos).to(tl.int32)
+        all = B * T
+        q_ptr = q + (bos * H + i_h).to(tl.int64) * K
+        k_ptr = k + (bos * H + i_h).to(tl.int64) * K
+        g_base = _bwd_intra_g_base(g, bos, i_b, i_hv, T_seq, K, HV, IS_VARLEN, G_T_CONTIG)
+        beta_ptr = beta + bos * HV + i_hv
+        dAqk_ptr = dAqk + (bos * HV + i_hv).to(tl.int64) * BT
+        dAkk_ptr = dAkk + (bos * HV + i_hv).to(tl.int64) * BT
+        dq_ptr = dq + (bos * HV + i_hv).to(tl.int64) * K
+        dq2_ptr = dq2 + (bos * HV + i_hv).to(tl.int64) * K
+        dk_part_ptr = dk_part + (bos * HV + i_hv).to(tl.int64) * K
+        dg_part_ptr = dg_part + (bos * HV + i_hv).to(tl.int64) * K
+        db_ptr = db + (i_k * all + bos).to(tl.int64) * HV + i_hv
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        o_i = tl.arange(0, BC)
+        for i_i in tl.static_range(NC):
+            i_ti = i_t * BT + i_i * BC
+            if i_ti < T_cur:
+                p_g = _bwd_intra_g_block_ptr(g_base, T_cur, i_ti, i_k * BK, BC, BK, g_row_stride, K)
+                b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+                p_b = tl.make_block_ptr(beta_ptr, (T_cur,), (HV,), (i_ti,), (BC,), (0,))
+                b_b = tl.load(p_b, boundary_check=(0,))
+                b_dq2 = tl.zeros([BC, BK], dtype=tl.float32)
+                b_dk2 = tl.zeros([BC, BK], dtype=tl.float32)
+                if i_i > 0:
+                    p_gn = g_base + i_ti.to(tl.int64) * g_row_stride + o_k
+                    b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
+                    for j_idx in tl.static_range(3):
+                        i_j = j_idx
+                        if i_j < i_i:
+                            p_k = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1),
+                                                    (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+                            p_gk = _bwd_intra_g_block_ptr(g_base, T_cur, i_t * BT + i_j * BC,
+                                                          i_k * BK, BC, BK, g_row_stride, K)
+                            p_dAqk = tl.make_block_ptr(dAqk_ptr, (T_cur, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
+                            p_dAkk = tl.make_block_ptr(dAkk_ptr, (T_cur, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
+                            b_k = tl.load(p_k, boundary_check=(0, 1))
+                            b_gk = tl.load(p_gk, boundary_check=(0, 1))
+                            b_kg = b_k * exp2(b_gn - b_gk.to(tl.float32))
+                            b_dAqk = tl.load(p_dAqk, boundary_check=(0, 1))
+                            b_dAkk = tl.load(p_dAkk, boundary_check=(0, 1))
+                            b_dq2 += tl.dot(b_dAqk.to(tl.float32), b_kg.to(tl.float32), allow_tf32=False)
+                            b_dk2 += tl.dot(b_dAkk.to(tl.float32), b_kg.to(tl.float32), allow_tf32=False)
+                    b_gqn = exp2(b_g - b_gn)
+                    b_dq2 *= b_gqn
+                    b_dk2 *= b_gqn
+                m_dA = (i_ti + o_i) < T_cur
+                o_dA = (i_ti + o_i).to(tl.int64) * HV * BT + i_i * BC
+                p_kj = k_ptr + i_ti.to(tl.int64) * H * K + o_k
+                p_gkj = g_base + i_ti.to(tl.int64) * g_row_stride + o_k
+                p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                p_k = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                if SAFE_GATE:
+                    p_gn = g_base + (i_ti + min(BC // 2, T_cur - i_ti - 1)).to(tl.int64) * g_row_stride + o_k
+                    b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
+                    p_dAqk = tl.make_block_ptr(dAqk_ptr, (T_cur, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
+                    p_dAkk = tl.make_block_ptr(dAkk_ptr, (T_cur, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
+                    b_dAqk_diag = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
+                    b_dAkk_diag = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
+                    m_i_diag = (o_i[:, None] >= o_i[None, :]) & (
+                        (i_ti + o_i[:, None]) < T_cur) & ((i_ti + o_i[None, :]) < T_cur)
+                    m_j_diag = (i_ti + o_i[:, None]) < T_cur
+                    b_dAqk_diag = tl.where(m_i_diag, b_dAqk_diag, 0.)
+                    b_dAkk_diag = tl.where(m_i_diag, b_dAkk_diag, 0.)
+                    b_g_diag = tl.where(m_j_diag, b_g - b_gn, 0.)
+                    exp_b_g_diag = tl.where(m_j_diag, exp2(b_g_diag), 0.)
+                    exp_neg_b_g_diag = tl.where(m_j_diag, exp2(-b_g_diag), 0.)
+                    b_k_exp = b_k * exp_neg_b_g_diag
+                    b_dq2 += tl.dot(b_dAqk_diag, b_k_exp, allow_tf32=False) * exp_b_g_diag
+                    b_dk2 += tl.dot(b_dAkk_diag, b_k_exp, allow_tf32=False) * exp_b_g_diag
+                else:
+                    for j in range(0, min(BC, T_cur - i_t * BT - i_i * BC)):
+                        b_dAqk = tl.load(dAqk_ptr + o_dA + j, mask=m_dA, other=0)
+                        b_dAkk = tl.load(dAkk_ptr + o_dA + j, mask=m_dA, other=0)
+                        b_kj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32)
+                        b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
+                        m_i = o_i[:, None] >= j
+                        b_gqk = exp2(b_g - b_gkj[None, :])
+                        b_dq2 += tl.where(m_i, b_dAqk[:, None] * b_kj[None, :] * b_gqk, 0.)
+                        b_dk2 += tl.where(m_i, b_dAkk[:, None] * b_kj[None, :] * b_gqk, 0.)
+                        p_kj += H * K
+                        p_gkj += g_row_stride
+                b_db = tl.sum(b_dk2 * b_k, 1)
+                b_dk2 *= b_b[:, None]
+                p_dq = tl.make_block_ptr(dq_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                p_dq2 = tl.make_block_ptr(dq2_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                p_dk_part = tl.make_block_ptr(dk_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                p_dg_part = tl.make_block_ptr(dg_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                p_db = tl.make_block_ptr(db_ptr, (T_cur,), (HV,), (i_ti,), (BC,), (0,))
+                b_dg_part = b_q * b_dq2
+                b_dq2 = b_dq2 + tl.load(p_dq, boundary_check=(0, 1))
+                tl.store(p_dq2, b_dq2.to(p_dq2.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_dk_part, b_dk2.to(p_dk_part.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_dg_part, b_dg_part.to(p_dg_part.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
 
-    all = B * T
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-    else:
-        bos, eos = i_b * T, i_b * T + T
-    T = eos - bos
 
-    i_ti = i_t * BT + i_i * BC
-    if i_ti >= T:
-        return
-
-    o_k = i_k * BK + tl.arange(0, BK)
-    m_k = o_k < K
-
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    g += (bos * HV + i_hv) * K
-    beta += bos * HV + i_hv
-
-    dAqk += (bos * HV + i_hv) * BT
-    dAkk += (bos * HV + i_hv) * BT
-    dq += (bos * HV + i_hv) * K
-    dq2 += (bos * HV + i_hv) * K
-    dk += (bos * HV + i_hv) * K
-    dk2 += (bos * HV + i_hv) * K
-    dg += (bos * HV + i_hv) * K
-    dg2 += (bos * HV + i_hv) * K
-    db += (i_k * all + bos) * HV + i_hv
-
-    p_g = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-
-    p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
-    b_b = tl.load(p_b, boundary_check=(0,))
-
-    b_dq2 = tl.zeros([BC, BK], dtype=tl.float32)
-    b_dk2 = tl.zeros([BC, BK], dtype=tl.float32)
-    if i_i > 0:
-        p_gn = g + i_ti * HV * K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
-        for i_j in range(0, i_i):
-            p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gk = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
-            p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (HV * BT, 1), (i_ti, i_j * BC), (BC, BC), (1, 0))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_gk = tl.load(p_gk, boundary_check=(0, 1))
-            b_kg = b_k * exp2(b_gn - b_gk)
-            b_dAqk = tl.load(p_dAqk, boundary_check=(0, 1))
-            b_dAkk = tl.load(p_dAkk, boundary_check=(0, 1))
-            b_dq2 += tl.dot(b_dAqk, b_kg, allow_tf32=False)
-            b_dk2 += tl.dot(b_dAkk, b_kg, allow_tf32=False)
-        b_gqn = exp2(b_g - b_gn)
-        b_dq2 *= b_gqn
-        b_dk2 *= b_gqn
-
+@triton.jit(do_not_specialize=['B', 'T', 'NT', 'BH_TOTAL', 'task_num', 'num_core'])
+def chunk_kda_bwd_kernel_intra_dkt_future_npu(
+    q, k, g, beta, dAqk, dAkk, dkt_part,
+    cu_seqlens, chunk_indices, B, T, NT, BH_TOTAL, task_num, num_core,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
+    BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
+    IS_VARLEN: tl.constexpr, SAFE_GATE: tl.constexpr, G_T_CONTIG: tl.constexpr,
+):
+    core_id = tl.program_id(0)
+    g_row_stride = _bwd_intra_g_row_stride(G_T_CONTIG, HV, K)
     o_i = tl.arange(0, BC)
-    m_dA = (i_ti + o_i) < T
-    o_dA = (i_ti + o_i) * HV * BT + i_i * BC
-    p_kj = k + i_ti * H * K + o_k
-    p_gkj = g + i_ti * HV * K + o_k
+    for task_id in tl.range(core_id, task_num, num_core):
+        i_bh = task_id % BH_TOTAL
+        rem = task_id // BH_TOTAL
+        i_t = rem % NT
+        i_kc = rem // NT
+        i_b, i_hv = i_bh // HV, i_bh % HV
+        i_h = i_hv // (HV // H)
+        i_k, i_i = i_kc // NC, i_kc % NC
+        T_seq = T
+        if IS_VARLEN:
+            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        else:
+            bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+        T_cur = (eos - bos).to(tl.int32)
+        i_ti = i_t * BT + i_i * BC
+        if i_ti < T_cur:
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            q_ptr = q + (bos * H + i_h).to(tl.int64) * K
+            k_ptr = k + (bos * H + i_h).to(tl.int64) * K
+            g_base = _bwd_intra_g_base(g, bos, i_b, i_hv, T_seq, K, HV, IS_VARLEN, G_T_CONTIG)
+            beta_ptr = beta + bos * HV + i_hv
+            dAqk_ptr = dAqk + (bos * HV + i_hv).to(tl.int64) * BT
+            dAkk_ptr = dAkk + (bos * HV + i_hv).to(tl.int64) * BT
+            dkt_part_ptr = dkt_part + (bos * HV + i_hv).to(tl.int64) * K
+            p_g = _bwd_intra_g_block_ptr(g_base, T_cur, i_ti, i_k * BK, BC, BK, g_row_stride, K)
+            b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+            b_dkt = tl.zeros([BC, BK], dtype=tl.float32)
+            nc_eff = min(NC, tl.cdiv(T_cur - i_t * BT, BC))
+            if i_i < nc_eff - 1:
+                p_gn = g_base + (min(i_ti + BC, T_cur) - 1).to(tl.int64) * g_row_stride + o_k
+                b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
+                for i_j in range(i_i + 1, nc_eff):
+                    p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+                    p_kj = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+                    p_gk = _bwd_intra_g_block_ptr(g_base, T_cur, i_t * BT + i_j * BC, i_k * BK, BC, BK, g_row_stride, K)
+                    p_bj = tl.make_block_ptr(beta_ptr, (T_cur,), (HV,), (i_t * BT + i_j * BC,), (BC,), (0,))
+                    p_dAqk = tl.make_block_ptr(dAqk_ptr, (BT, T_cur), (1, HV * BT),
+                                               (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
+                    p_dAkk = tl.make_block_ptr(dAkk_ptr, (BT, T_cur), (1, HV * BT),
+                                               (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
+                    b_bj = tl.load(p_bj, boundary_check=(0,))
+                    b_qj = tl.load(p_q, boundary_check=(0, 1))
+                    b_kj = tl.load(p_kj, boundary_check=(0, 1))
+                    b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
+                    b_dAqk = tl.load(p_dAqk, boundary_check=(0, 1))
+                    b_dAkk = tl.load(p_dAkk, boundary_check=(0, 1))
+                    o_j = i_t * BT + i_j * BC + o_i
+                    m_j = o_j < T_cur
+                    b_gkn = exp2(b_gk - b_gn)
+                    b_qg = b_qj * tl.where(m_j[:, None], b_gkn, 0)
+                    b_kbg = b_kj * b_bj[:, None] * tl.where(m_j[:, None], b_gkn, 0)
+                    b_dkt += tl.dot(b_dAqk.to(tl.float32), b_qg.to(tl.float32), allow_tf32=False)
+                    b_dkt += tl.dot(b_dAkk.to(tl.float32), b_kbg.to(tl.float32), allow_tf32=False)
+                b_dkt *= exp2(b_gn - b_g)
+            p_dkt_part = tl.make_block_ptr(dkt_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            tl.store(p_dkt_part, b_dkt.to(p_dkt_part.dtype.element_ty), boundary_check=(0, 1))
 
-    p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
 
-    if SAFE_GATE:
-        # Midpoint-offset vectorized path (bounded under lower_bound=-5).
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV * K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
-
-        p_dAqk = tl.make_block_ptr(dAqk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
-        p_dAkk = tl.make_block_ptr(dAkk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
-        b_dAqk_diag_qk = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
-        b_dAkk_diag_qk = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
-
-        m_i_diag_qk = (o_i[:, None] >= o_i[None, :]) & ((i_ti + o_i[:, None]) < T) & ((i_ti + o_i[None, :]) < T)
-        m_j_diag_qk = (i_ti + o_i[:, None]) < T
-
-        b_dAqk_diag_qk = tl.where(m_i_diag_qk, b_dAqk_diag_qk, 0.)
-        b_dAkk_diag_qk = tl.where(m_i_diag_qk, b_dAkk_diag_qk, 0.)
-        b_g_diag_qk = tl.where(m_j_diag_qk, b_g - b_gn, 0.)
-        exp_b_g_diag_qk = tl.where(m_j_diag_qk, exp2(b_g_diag_qk), 0.)
-        exp_neg_b_g_diag_qk = tl.where(m_j_diag_qk, exp2(-b_g_diag_qk), 0.)
-
-        b_k_exp_diag_qk = b_k * exp_neg_b_g_diag_qk
-        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk, allow_tf32=False) * exp_b_g_diag_qk
-        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk, allow_tf32=False) * exp_b_g_diag_qk
-    else:
-        # Pairwise scalar path required for unbounded non-safe gates (avoids Inf/NaN).
-        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-            b_dAqk = tl.load(dAqk + o_dA + j, mask=m_dA, other=0)
-            b_dAkk = tl.load(dAkk + o_dA + j, mask=m_dA, other=0)
-            b_kj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32)
-            b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
-            m_i = o_i[:, None] >= j
-            b_gqk = exp2(b_g - b_gkj[None, :])
-            b_dq2 += tl.where(m_i, b_dAqk[:, None] * b_kj[None, :] * b_gqk, 0.)
-            b_dk2 += tl.where(m_i, b_dAkk[:, None] * b_kj[None, :] * b_gqk, 0.)
-
-            p_kj += H * K
-            p_gkj += HV * K
-
-    b_db = tl.sum(b_dk2 * b_k, 1)
-    b_dk2 *= b_b[:, None]
-
-    p_dq = tl.make_block_ptr(dq, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_dq2 = tl.make_block_ptr(dq2, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_db = tl.make_block_ptr(db, (T,), (HV,), (i_ti,), (BC,), (0,))
-
-    b_dg2 = b_q * b_dq2
-    b_dq2 = b_dq2 + tl.load(p_dq, boundary_check=(0, 1))
-    tl.store(p_dq2, b_dq2.to(p_dq2.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
-
-    # synchronize before the second half of the kernel that reuses the same tiles.
-    tl.debug_barrier()
-    b_dkt = tl.zeros([BC, BK], dtype=tl.float32)
-
-    NC = min(NC, tl.cdiv(T - i_t * BT, BC))
-    if i_i < NC - 1:
-        p_gn = g + (min(i_ti + BC, T) - 1) * HV * K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
-        for i_j in range(i_i + 1, NC):
-            p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_gk = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-            p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_t * BT + i_j * BC,), (BC,), (0,))
-            p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, HV * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
-            p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, HV * BT), (i_i * BC, i_t * BT + i_j * BC), (BC, BC), (0, 1))
+@triton.jit(do_not_specialize=['B', 'T', 'NT', 'BH_TOTAL', 'task_num', 'num_core'])
+def chunk_kda_bwd_kernel_intra_dk_dg_npu(
+    q, k, g, beta, dAqk, dAkk, dk, dk2, dg, dg2, dk_part, dg_part, dkt_part,
+    cu_seqlens, chunk_indices, B, T, NT, BH_TOTAL, task_num, num_core,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
+    BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
+    IS_VARLEN: tl.constexpr, SAFE_GATE: tl.constexpr, G_T_CONTIG: tl.constexpr,
+):
+    core_id = tl.program_id(0)
+    g_row_stride = _bwd_intra_g_row_stride(G_T_CONTIG, HV, K)
+    o_i = tl.arange(0, BC)
+    for task_id in tl.range(core_id, task_num, num_core):
+        i_bh = task_id % BH_TOTAL
+        rem = task_id // BH_TOTAL
+        i_t = rem % NT
+        i_kc = rem // NT
+        i_b, i_hv = i_bh // HV, i_bh % HV
+        i_h = i_hv // (HV // H)
+        i_k, i_i = i_kc // NC, i_kc % NC
+        T_seq = T
+        if IS_VARLEN:
+            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        else:
+            bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+        T_cur = (eos - bos).to(tl.int32)
+        i_ti = i_t * BT + i_i * BC
+        if i_ti < T_cur:
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            q_ptr = q + (bos * H + i_h).to(tl.int64) * K
+            k_ptr = k + (bos * H + i_h).to(tl.int64) * K
+            g_base = _bwd_intra_g_base(g, bos, i_b, i_hv, T_seq, K, HV, IS_VARLEN, G_T_CONTIG)
+            beta_ptr = beta + bos * HV + i_hv
+            dAqk_ptr = dAqk + (bos * HV + i_hv).to(tl.int64) * BT
+            dAkk_ptr = dAkk + (bos * HV + i_hv).to(tl.int64) * BT
+            dk_ptr = dk + (bos * HV + i_hv).to(tl.int64) * K
+            dk2_ptr = dk2 + (bos * HV + i_hv).to(tl.int64) * K
+            dg_ptr = dg + (bos * HV + i_hv).to(tl.int64) * K
+            dg2_ptr = dg2 + (bos * HV + i_hv).to(tl.int64) * K
+            dk_part_ptr = dk_part + (bos * HV + i_hv).to(tl.int64) * K
+            dg_part_ptr = dg_part + (bos * HV + i_hv).to(tl.int64) * K
+            dkt_part_ptr = dkt_part + (bos * HV + i_hv).to(tl.int64) * K
+            p_g = _bwd_intra_g_block_ptr(g_base, T_cur, i_ti, i_k * BK, BC, BK, g_row_stride, K)
+            b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+            p_k = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            p_b = tl.make_block_ptr(beta_ptr, (T_cur,), (HV,), (i_ti,), (BC,), (0,))
             b_b = tl.load(p_b, boundary_check=(0,))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_kb = tl.load(p_k, boundary_check=(0, 1)) * b_b[:, None]
-            b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
-            b_dAqk = tl.load(p_dAqk, boundary_check=(0, 1))
-            b_dAkk = tl.load(p_dAkk, boundary_check=(0, 1))
-
-            o_j = i_t * BT + i_j * BC + o_i
-            m_j = o_j < T
-            b_gkn = exp2(b_gk - b_gn)
-            b_qg = b_q * tl.where(m_j[:, None], b_gkn, 0)
-            b_kbg = b_kb * tl.where(m_j[:, None], b_gkn, 0)
-            b_dkt += tl.dot(b_dAqk, b_qg, allow_tf32=False)
-            b_dkt += tl.dot(b_dAkk, b_kbg, allow_tf32=False)
-        b_dkt *= exp2(b_gn - b_g)
-
-    o_dA = i_ti * HV * BT + i_i * BC + o_i
-    p_qj = q + i_ti * H * K + o_k
-    p_kj = k + i_ti * H * K + o_k
-    p_gkj = g + i_ti * HV * K + o_k
-    p_bj = beta + i_ti * HV
-
-    if SAFE_GATE:
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV * K + o_k
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        p_b = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
-        b_b = tl.load(p_b, boundary_check=(0,))
-
-        p_dAqk = tl.make_block_ptr(dAqk, (BT, T), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
-        p_dAkk = tl.make_block_ptr(dAkk, (BT, T), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
-        b_dAqk_diag_kk = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
-        b_dAkk_diag_kk = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
-
-        m_i_diag_kk = (o_i[:, None] <= o_i[None, :]) & ((i_ti + o_i[:, None]) < T) & ((i_ti + o_i[None, :]) < T)
-        m_j_diag_kk = (i_ti + o_i[:, None]) < T
-
-        b_dAqk_diag_kk = tl.where(m_i_diag_kk, b_dAqk_diag_kk, 0.)
-        b_dAkk_diag_kk = tl.where(m_i_diag_kk, b_dAkk_diag_kk, 0.)
-        b_g_diag_kk = tl.where(m_j_diag_kk, b_g - b_gn, 0.)
-        exp_b_g_diag_kk = tl.where(m_j_diag_kk, exp2(b_g_diag_kk), 0.)
-        exp_neg_b_g_diag_kk = tl.where(m_j_diag_kk, exp2(-b_g_diag_kk), 0.)
-
-        b_q_exp = b_q * exp_b_g_diag_kk
-        b_kb_exp = b_k * b_b[:, None] * exp_b_g_diag_kk
-
-        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, allow_tf32=False) * exp_neg_b_g_diag_kk
-        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, allow_tf32=False) * exp_neg_b_g_diag_kk
-    else:
-        for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
-            b_dAqk = tl.load(dAqk + o_dA + j * HV * BT)
-            b_dAkk = tl.load(dAkk + o_dA + j * HV * BT)
-            b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
-            b_kbj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32) * tl.load(p_bj)
-            b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
-            m_i = o_i[:, None] <= j
-            b_gkq = exp2(b_gkj[None, :] - b_g)
-            b_dkt += tl.where(m_i, b_dAqk[:, None] * b_qj[None, :] * b_gkq, 0.)
-            b_dkt += tl.where(m_i, b_dAkk[:, None] * b_kbj[None, :] * b_gkq, 0.)
-
-            p_qj += H * K
-            p_kj += H * K
-            p_gkj += HV * K
-            p_bj += HV
-
-    p_dk = tl.make_block_ptr(dk, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_dk2 = tl.make_block_ptr(dk2, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_dg = tl.make_block_ptr(dg, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-    p_dg2 = tl.make_block_ptr(dg2, (T, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
-
-    b_dg2 += (b_dk2 - b_dkt) * b_k + tl.load(p_dg, boundary_check=(0, 1))
-    b_dk2 += tl.load(p_dk, boundary_check=(0, 1))
-    b_dk2 += b_dkt
-
-    tl.store(p_dk2, b_dk2.to(p_dk2.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_dg2, b_dg2.to(p_dg2.dtype.element_ty), boundary_check=(0, 1))
+            p_dk_part = tl.make_block_ptr(dk_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_dg_part = tl.make_block_ptr(dg_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_dkt_part = tl.make_block_ptr(dkt_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            b_dk2 = tl.load(p_dk_part, boundary_check=(0, 1)).to(tl.float32)
+            b_dg2 = tl.load(p_dg_part, boundary_check=(0, 1)).to(tl.float32)
+            b_dkt = tl.load(p_dkt_part, boundary_check=(0, 1)).to(tl.float32)
+            o_dA = i_ti.to(tl.int64) * HV * BT + i_i * BC + o_i
+            p_qj = q_ptr + i_ti.to(tl.int64) * H * K + o_k
+            p_kj = k_ptr + i_ti.to(tl.int64) * H * K + o_k
+            p_gkj = g_base + i_ti.to(tl.int64) * g_row_stride + o_k
+            p_bj = beta_ptr + i_ti * HV
+            if SAFE_GATE:
+                p_gn = g_base + (i_ti + min(BC // 2, T_cur - i_ti - 1)).to(tl.int64) * g_row_stride + o_k
+                b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
+                p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                p_dAqk = tl.make_block_ptr(dAqk_ptr, (BT, T_cur), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
+                p_dAkk = tl.make_block_ptr(dAkk_ptr, (BT, T_cur), (1, HV * BT), (i_i * BC, i_ti), (BC, BC), (0, 1))
+                b_dAqk_diag = tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32)
+                b_dAkk_diag = tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32)
+                m_i_diag = (o_i[:, None] <= o_i[None, :]) & ((i_ti + o_i[:, None]) < T_cur) & ((i_ti + o_i[None, :]) < T_cur)
+                m_j_diag = (i_ti + o_i[:, None]) < T_cur
+                b_dAqk_diag = tl.where(m_i_diag, b_dAqk_diag, 0.)
+                b_dAkk_diag = tl.where(m_i_diag, b_dAkk_diag, 0.)
+                b_g_diag = tl.where(m_j_diag, b_g - b_gn, 0.)
+                exp_b_g_diag = tl.where(m_j_diag, exp2(b_g_diag), 0.)
+                exp_neg_b_g_diag = tl.where(m_j_diag, exp2(-b_g_diag), 0.)
+                b_q_exp = b_q * exp_b_g_diag
+                b_kb_exp = b_k * b_b[:, None] * exp_b_g_diag
+                b_dkt += tl.dot(b_dAqk_diag, b_q_exp, allow_tf32=False) * exp_neg_b_g_diag
+                b_dkt += tl.dot(b_dAkk_diag, b_kb_exp, allow_tf32=False) * exp_neg_b_g_diag
+            else:
+                for j in range(0, min(BC, T_cur - i_t * BT - i_i * BC)):
+                    b_dAqk = tl.load(dAqk_ptr + o_dA + j * HV * BT)
+                    b_dAkk = tl.load(dAkk_ptr + o_dA + j * HV * BT)
+                    b_qj = tl.load(p_qj, mask=m_k, other=0).to(tl.float32)
+                    b_kbj = tl.load(p_kj, mask=m_k, other=0).to(tl.float32) * tl.load(p_bj)
+                    b_gkj = tl.load(p_gkj, mask=m_k, other=0).to(tl.float32)
+                    m_i = o_i[:, None] <= j
+                    b_gkq = exp2(b_gkj[None, :] - b_g)
+                    b_dkt += tl.where(m_i, b_dAqk[:, None] * b_qj[None, :] * b_gkq, 0.)
+                    b_dkt += tl.where(m_i, b_dAkk[:, None] * b_kbj[None, :] * b_gkq, 0.)
+                    p_qj += H * K
+                    p_kj += H * K
+                    p_gkj += g_row_stride
+                    p_bj += HV
+            p_dk = tl.make_block_ptr(dk_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_dk2 = tl.make_block_ptr(dk2_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_dg = tl.make_block_ptr(dg_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            p_dg2 = tl.make_block_ptr(dg2_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
+            b_dg2 += (b_dk2 - b_dkt) * b_k + tl.load(p_dg, boundary_check=(0, 1))
+            b_dk2 += tl.load(p_dk, boundary_check=(0, 1))
+            b_dk2 += b_dkt
+            tl.store(p_dk2, b_dk2.to(p_dk2.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_dg2, b_dg2.to(p_dg2.dtype.element_ty), boundary_check=(0, 1))
 
 
 @input_guard
@@ -986,47 +1034,88 @@ def chunk_kda_bwd_intra_npu(
     NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
     is_varlen = cu_seqlens is not None
+    g_arg, g_t_contig = _gk_npu_arg(g, HV)
 
     dq2 = torch.empty_like(dq)
     dk2 = torch.empty_like(dk)
+    dk_part = torch.empty_like(dk)
+    dg_part = torch.empty_like(dg, dtype=torch.float)
+    dkt_part = torch.empty_like(dk, dtype=torch.float)
     db2 = beta.new_empty(NK, *beta.shape, dtype=torch.float)
     dg2 = torch.empty_like(dg, dtype=torch.float)
 
-    _launch_bwd_intra_kernel(
-        chunk_kda_bwd_kernel_intra_npu,
-        nk_nc=NK * NC,
-        nt=NT,
-        bh_total=B * HV,
+    bh_total = B * HV
+    task_num_dq = NK * NT * bh_total
+    task_num_nc = NK * NC * NT * bh_total
+    common_launch = dict(
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        B=B,
+        T=T,
+        NT=NT,
+        BH_TOTAL=bh_total,
+        H=H,
+        HV=HV,
+        K=K,
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        NC=NC,
+        IS_VARLEN=is_varlen,
+        SAFE_GATE=safe_gate,
+        G_T_CONTIG=g_t_contig,
+    )
+
+    _launch_bwd_intra_core_grid(
+        chunk_kda_bwd_kernel_intra_dq_db_npu,
+        task_num=task_num_dq,
         kernel_kwargs=dict(
             q=q,
             k=k,
-            g=g,
+            g=g_arg,
             beta=beta,
             dAqk=dAqk,
             dAkk=dAkk,
             dq=dq,
             dq2=dq2,
+            dk_part=dk_part,
+            dg_part=dg_part,
+            db=db2,
+            **common_launch,
+        ),
+    )
+    _launch_bwd_intra_core_grid(
+        chunk_kda_bwd_kernel_intra_dkt_future_npu,
+        task_num=task_num_nc,
+        kernel_kwargs=dict(
+            q=q,
+            k=k,
+            g=g_arg,
+            beta=beta,
+            dAqk=dAqk,
+            dAkk=dAkk,
+            dkt_part=dkt_part,
+            **common_launch,
+        ),
+    )
+    _launch_bwd_intra_core_grid(
+        chunk_kda_bwd_kernel_intra_dk_dg_npu,
+        task_num=task_num_nc,
+        kernel_kwargs=dict(
+            q=q,
+            k=k,
+            g=g_arg,
+            beta=beta,
+            dAqk=dAqk,
+            dAkk=dAkk,
             dk=dk,
             dk2=dk2,
             dg=dg,
             dg2=dg2,
-            db=db2,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            B=B,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            BT=BT,
-            BC=BC,
-            BK=BK,
-            NC=NC,
-            IS_VARLEN=is_varlen,
-            SAFE_GATE=safe_gate,
-            NKNC_OFFSET=0,
-            NT_OFFSET=0,
-            BH_OFFSET=0,
+            dk_part=dk_part,
+            dg_part=dg_part,
+            dkt_part=dkt_part,
+            **common_launch,
         ),
     )
     dq = dq2
