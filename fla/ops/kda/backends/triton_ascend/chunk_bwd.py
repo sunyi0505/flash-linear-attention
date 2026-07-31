@@ -619,97 +619,10 @@ def chunk_kda_bwd_kernel_wy_dw_part_npu(
 
 
 @triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_wy_dA_mask_npu(
+def chunk_kda_bwd_kernel_wy_dA_fused_npu(
+    A,
     beta,
     dA_acc,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    HV: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
-):
-    """In-place: dA_acc = mask * dA_acc * beta[None, :]."""
-    i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
-    i_b, i_hv = i_bh // HV, i_bh % HV
-
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-    else:
-        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
-
-    beta += bos * HV + i_hv
-    dA_acc += (bos * HV + i_hv) * BT
-
-    o_i = tl.arange(0, BC)
-    n_sub = BT // BC
-
-    for s_a in range(n_sub):
-        i_tc_a = i_t * BT + s_a * BC
-        m_a = (i_tc_a + o_i) < T
-        o_t_a = i_tc_a + o_i
-        for s_b in range(n_sub):
-            i_tc_b = i_t * BT + s_b * BC
-            m_b = (i_tc_b + o_i) < T
-            o_t_b = i_tc_b + o_i
-            p_dA = tl.make_block_ptr(dA_acc, (T, BT), (HV * BT, 1), (i_tc_a, s_b * BC), (BC, BC), (1, 0))
-            p_beta_b = tl.make_block_ptr(beta, (T,), (HV,), (i_tc_b,), (BC,), (0,))
-            b_dA = tl.load(p_dA, boundary_check=(0, 1)).to(tl.float32)
-            b_beta_b = tl.load(p_beta_b, boundary_check=(0,))
-            m_A = (o_t_a[:, None] > o_t_b[None, :]) & (m_a[:, None] & m_b[None, :])
-            b_M = tl.where(m_A, b_dA * b_beta_b[None, :], 0)
-            tl.store(p_dA, b_M.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_wy_dA_mid_npu(
-    A,
-    dA_acc,
-    dA_mid,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    HV: tl.constexpr,
-    BT: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
-):
-    """T = dA_acc @ A after mask*beta has been applied to dA_acc."""
-    i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
-    i_b, i_hv = i_bh // HV, i_bh % HV
-
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-    else:
-        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
-
-    A += (bos * HV + i_hv) * BT
-    dA_acc += (bos * HV + i_hv) * BT
-    dA_mid += (bos * HV + i_hv) * BT
-
-    p_A = tl.make_block_ptr(A, (BT, T), (1, HV * BT), (0, i_t * BT), (BT, BT), (0, 1))
-    p_dA = tl.make_block_ptr(dA_acc, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    p_out = tl.make_block_ptr(dA_mid, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_dA = tl.load(p_dA, boundary_check=(0, 1)).to(tl.float32)
-    b_out = tl.dot(b_dA.to(b_A.dtype), b_A, allow_tf32=False)
-    tl.store(p_out, b_out.to(p_out.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.jit(do_not_specialize=['T'])
-def chunk_kda_bwd_kernel_wy_dA_finalize_npu(
-    A,
-    dA_mid,
     db_acc,
     dA,
     db,
@@ -722,6 +635,7 @@ def chunk_kda_bwd_kernel_wy_dA_finalize_npu(
     NT_OFFSET: tl.constexpr,
     BH_OFFSET: tl.constexpr,
 ):
+    """Fuse dA_acc mask/beta, intermediate T, and final dA computation."""
     i_t = tl.program_id(0) + NT_OFFSET
     i_bh = tl.program_id(1) + BH_OFFSET
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -734,16 +648,25 @@ def chunk_kda_bwd_kernel_wy_dA_finalize_npu(
         bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
 
     A += (bos * HV + i_hv) * BT
-    dA_mid += (bos * HV + i_hv) * BT
+    beta += bos * HV + i_hv
+    dA_acc += (bos * HV + i_hv) * BT
     db_acc += bos * HV + i_hv
     dA += (bos * HV + i_hv) * BT
     db += bos * HV + i_hv
 
     p_A = tl.make_block_ptr(A, (BT, T), (1, HV * BT), (0, i_t * BT), (BT, BT), (0, 1))
-    p_T = tl.make_block_ptr(dA_mid, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-
+    p_dA = tl.make_block_ptr(dA_acc, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_dA_out = tl.make_block_ptr(dA, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_T = tl.load(p_T, boundary_check=(0, 1)).to(tl.float32)
+    b_dA = tl.load(p_dA, boundary_check=(0, 1)).to(tl.float32)
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    b_beta = tl.load(beta + o_t * HV, mask=m_t, other=0)
+    m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t[None, :])
+    b_dA = tl.where(m_A, b_dA * b_beta[None, :], 0)
+
+    b_T = tl.dot(b_dA.to(b_A.dtype), b_A, allow_tf32=False)
     b_dA = tl.dot(b_A, b_T.to(b_A.dtype), allow_tf32=False)
 
     o_t = i_t * BT + tl.arange(0, BT)
@@ -751,8 +674,7 @@ def chunk_kda_bwd_kernel_wy_dA_finalize_npu(
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t[None, :])
     b_dA = tl.where(m_A, -b_dA, 0)
 
-    p_dA = tl.make_block_ptr(dA, (T, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_dA_out, b_dA.to(p_dA_out.dtype.element_ty), boundary_check=(0, 1))
 
     p_db_acc = tl.make_block_ptr(db_acc, (T,), (HV,), (i_t * BT,), (BT,), (0,))
     p_db = tl.make_block_ptr(db, (T,), (HV,), (i_t * BT,), (BT,), (0,))
@@ -891,36 +813,13 @@ def chunk_kda_bwd_wy_dqkg_fused_npu(
         )
 
     _launch_2d_kernel(
-        chunk_kda_bwd_kernel_wy_dA_mask_npu,
+        chunk_kda_bwd_kernel_wy_dA_fused_npu,
         nt=NT,
         bh_total=B * HV,
         kernel_kwargs=dict(
+            A=A,
             beta=beta,
             dA_acc=dA_acc,
-            BC=_BC,
-            **common_launch,
-        ),
-    )
-
-    _launch_2d_kernel(
-        chunk_kda_bwd_kernel_wy_dA_mid_npu,
-        nt=NT,
-        bh_total=B * HV,
-        kernel_kwargs=dict(
-            A=A,
-            dA_acc=dA_acc,
-            dA_mid=dA_acc,
-            **common_launch,
-        ),
-    )
-
-    _launch_2d_kernel(
-        chunk_kda_bwd_kernel_wy_dA_finalize_npu,
-        nt=NT,
-        bh_total=B * HV,
-        kernel_kwargs=dict(
-            A=A,
-            dA_mid=dA_acc,
             db_acc=db_acc,
             dA=dA,
             db=db,
