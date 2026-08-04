@@ -15,6 +15,475 @@ from einops import rearrange
 from fla.ops.utils import prepare_chunk_indices
 from fla.utils import input_guard
 
+# Compatibility shim: extract_slice/insert_slice.
+try:
+    from triton.language.extra.cann.extension import extract_slice, insert_slice
+
+    if not hasattr(tl, 'extract_slice'):
+        tl.extract_slice = extract_slice
+    if not hasattr(tl, 'insert_slice'):
+        tl.insert_slice = insert_slice
+except ImportError:
+    pass
+
+
+def _get_vector_num() -> int:
+    """Return Ascend vector-core count for 1D core-grid launches."""
+    from triton.runtime import driver
+
+    device = torch.npu.current_device()
+    properties = driver.active.utils.get_device_properties(device)
+    return properties['num_vectorcore']
+
+
+def _select_coregrid_bd(D: int, preferred: int) -> int | None:
+    """Largest power-of-2 BD <= preferred that exactly divides D.
+
+    The core-grid kernels are reliable when channel tiles land on exact D
+    boundaries; odd widths (e.g. D=200) fall back to the legacy path.
+    """
+    bd = min(preferred, triton.next_power_of_2(max(D, 1)))
+    while bd > 8 and (bd > D or D % bd != 0):
+        bd //= 2
+    if bd > D or D % bd != 0:
+        return None
+    return bd
+
+
+@triton.heuristics({
+    'HAS_WEIGHT': lambda args: args['weight'] is not None,
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+    'HAS_RESIDUAL': lambda args: args['residual'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['initial_state'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit
+def causal_conv1d_fwd_coregrid_kernel(
+    x,
+    y,
+    weight,
+    bias,
+    residual,
+    cu_seqlens,
+    initial_state,
+    chunk_indices,
+    B,
+    T,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    NUM_CHKS: tl.int32,
+    NUM_BLKS_D: tl.int32,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+
+    total_tasks = NUM_BLKS_D * NUM_CHKS
+
+    for task_id in range(pid, total_tasks, num_programs):
+        i_d = task_id % NUM_BLKS_D
+        i_chk = task_id // NUM_BLKS_D
+
+        if IS_VARLEN:
+            i_n = tl.load(chunk_indices + i_chk * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_chk * 2 + 1).to(tl.int32)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_len = eos - bos
+        else:
+            NT_per_seq = tl.cdiv(T, BT)
+            i_b = i_chk // NT_per_seq
+            i_t = i_chk % NT_per_seq
+            i_n = i_b
+            bos = (i_b * T).to(tl.int64)
+            eos = (i_b * T + T).to(tl.int64)
+            T_len = T
+
+        o_d = i_d * BD + tl.arange(0, BD)
+        m_d = o_d < D
+
+        # Tail-of-allocation guard: block end in absolute packed rows must not
+        # exceed B*T, else MTE DMA touches unmapped pages.
+        is_tail_chunk = (bos + i_t * BT + BT) > (B * T)
+
+        if HAS_WEIGHT:
+            p_w = tl.make_block_ptr(weight, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1))
+
+        b_y = tl.zeros((BT, BD), dtype=tl.float32)
+        yi_offset_1 = i_d * BD + tl.arange(0, BD)[None, :]
+
+        if not USE_INITIAL_STATE:
+            for i_w in tl.static_range(-W + 1, 1):
+                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
+                # Intra-loop load: preloading overflows UB under certain tiling.
+                b_yi = tl.load(x + bos * D + yi_offset_0 * D + yi_offset_1, mask=mask, other=0.).to(tl.float32)
+                if HAS_WEIGHT:
+                    b_yi *= tl.extract_slice(b_w, [i_w + W - 1, 0], [1, BD], [1, 1])
+                b_y += b_yi
+        elif i_t * BT >= W:
+            for i_w in tl.static_range(-W + 1, 1):
+                yi_offset_0 = i_t * BT + i_w + tl.arange(0, BT)[:, None]
+                mask = (yi_offset_0 < T_len) & (yi_offset_1 < D) & (yi_offset_0 >= 0)
+                b_yi = tl.load(x + bos * D + yi_offset_0 * D + yi_offset_1, mask=mask, other=0.).to(tl.float32)
+                if HAS_WEIGHT:
+                    b_yi *= tl.extract_slice(b_w, [i_w + W - 1, 0], [1, BD], [1, 1])
+                b_y += b_yi
+        else:
+            o_t = i_t * BT + tl.arange(0, BT)
+            for i_w in tl.static_range(-W + 1, 1):
+                o_x = o_t + i_w
+                m_x = ((o_x >= 0) & (o_x < T_len))[:, None] & m_d
+                m_c = ((o_x + W >= 0) & (o_x < 0))[:, None] & m_d
+                b_yi = tl.load(x + bos * D + o_x[:, None] * D + o_d, mask=m_x, other=0).to(tl.float32)
+                b_yi += tl.load(
+                    initial_state + i_n * D * W + o_d * W + (o_x + W)[:, None], mask=m_c, other=0,
+                ).to(tl.float32)
+                if HAS_WEIGHT:
+                    b_yi *= tl.extract_slice(b_w, [i_w + W - 1, 0], [1, BD], [1, 1])
+                b_y += b_yi
+
+        if HAS_BIAS:
+            b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
+        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+            b_y = b_y * tl.sigmoid(b_y)
+
+        if HAS_RESIDUAL:
+            if is_tail_chunk:
+                o_t_r = i_t * BT + tl.arange(0, BT)
+                m_t_r = (o_t_r >= 0) & (o_t_r < T_len)
+                b_residual = tl.load(
+                    residual + bos * D + o_t_r[:, None] * D + o_d[None, :],
+                    mask=m_t_r[:, None] & m_d[None, :],
+                    other=0.,
+                )
+            else:
+                p_residual = tl.make_block_ptr(
+                    residual + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0),
+                )
+                b_residual = tl.load(p_residual, boundary_check=(0, 1))
+            b_y += b_residual
+
+        if is_tail_chunk:
+            o_t_y = i_t * BT + tl.arange(0, BT)
+            m_t_y = (o_t_y >= 0) & (o_t_y < T_len)
+            b_y_cast = tl.cast(b_y, dtype=y.dtype.element_ty, fp_downcast_rounding='rtne')
+            tl.store(
+                y + bos * D + o_t_y[:, None] * D + o_d[None, :],
+                b_y_cast,
+                mask=m_t_y[:, None] & m_d[None, :],
+            )
+        else:
+            p_y = tl.make_block_ptr(y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
+            tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'HAS_WEIGHT': lambda args: args['dw'] is not None,
+    'HAS_BIAS': lambda args: args['db'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['dh0'] is not None,
+    'USE_FINAL_STATE': lambda args: args['dht'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit
+def causal_conv1d_bwd_coregrid_kernel(
+    x,
+    y,
+    weight,
+    initial_state,
+    dh0,
+    dht,
+    dy,
+    dx,
+    dw,
+    db,
+    cu_seqlens,
+    chunk_indices,
+    B,
+    T,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_FINAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    NUM_BLKS_D: tl.int32,
+    NUM_CHKS: tl.int32,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+
+    # Packed row count is the allocation bound of x/dy/dx. Tail chunks whose
+    # block end overshoots it trigger MTE "DDR address out of range". Layout is
+    # always [B, T, D], varlen or not.
+    TOTAL_ROWS = B * T
+    total_tasks = NUM_CHKS * NUM_BLKS_D
+
+    for task_id in range(pid, total_tasks, num_programs):
+        i_d = task_id % NUM_BLKS_D
+        i_chk = task_id // NUM_BLKS_D
+
+        if IS_VARLEN:
+            i_tg = i_chk
+            i_n = tl.load(chunk_indices + i_chk * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_chk * 2 + 1).to(tl.int32)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_len = eos - bos
+        else:
+            NT_per_seq = tl.cdiv(T, BT)
+            i_b = i_chk // NT_per_seq
+            i_t = i_chk % NT_per_seq
+            i_tg = i_chk
+            i_n = i_b
+            bos = (i_b * T).to(tl.int64)
+            eos = (i_b * T + T).to(tl.int64)
+            T_len = T
+
+        o_d = i_d * BD + tl.arange(0, BD)
+        m_d = o_d < D
+        is_tail_chunk = (bos + i_t * BT + BT + W - 1) > TOTAL_ROWS
+
+        if HAS_WEIGHT:
+            if is_tail_chunk:
+                o_t_x = i_t * BT + tl.arange(0, BT)
+                m_t_x = (o_t_x >= 0) & (o_t_x < T_len)
+                b_x = tl.load(
+                    x + bos * D + o_t_x[:, None] * D + o_d[None, :],
+                    mask=m_t_x[:, None] & m_d[None, :],
+                    other=0,
+                )
+            else:
+                p_x = tl.make_block_ptr(x + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
+                b_x = tl.load(p_x, boundary_check=(0, 1))
+            p_w = tl.make_block_ptr(weight, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
+            b_w = tl.load(p_w, boundary_check=(0, 1), padding_option='zero')
+
+        b_dx = tl.zeros((BT, BD), dtype=tl.float32)
+        if HAS_BIAS:
+            b_db = tl.zeros((BD,), dtype=tl.float32)
+
+        if not USE_FINAL_STATE and not USE_INITIAL_STATE:
+            b_dw = tl.zeros((W, BD), dtype=tl.float32)
+
+            if is_tail_chunk:
+                o_t_full = i_t * BT + tl.arange(0, BT + W - 1)
+                m_t_full = (o_t_full >= 0) & (o_t_full < T_len)
+                b_dy = tl.load(
+                    dy + bos * D + o_t_full[:, None] * D + o_d[None, :],
+                    mask=m_t_full[:, None] & m_d[None, :],
+                    other=0.,
+                ).to(tl.float32)
+                if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                    b_y = tl.load(
+                        y + bos * D + o_t_full[:, None] * D + o_d[None, :],
+                        mask=m_t_full[:, None] & m_d[None, :],
+                        other=0.,
+                    ).to(tl.float32)
+            else:
+                p_dy = tl.make_block_ptr(
+                    dy + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT + W - 1, BD), (1, 0),
+                )
+                b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+                if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                    p_y = tl.make_block_ptr(
+                        y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT + W - 1, BD), (1, 0),
+                    )
+                    b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
+
+            if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                b_ys = tl.sigmoid(b_y)
+                b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+
+            for i_w in tl.static_range(0, W):
+                b_dy_sub = tl.extract_slice(b_dy, [i_w, 0], [BT, BD], [1, 1])
+                b_wdy = b_dy_sub
+                if HAS_WEIGHT:
+                    b_wdy = b_wdy * tl.extract_slice(b_w, [W - i_w - 1, 0], [1, BD], [1, 1])
+                    b_dw_sub = tl.sum(b_dy_sub * b_x, 0)
+                    b_dw = tl.insert_slice(b_dw, b_dw_sub[None, :], [W - i_w - 1, 0], [1, BD], [1, 1])
+                if HAS_BIAS and i_w == 0:
+                    b_db += tl.sum(b_dy_sub, 0)
+                b_dx += b_wdy
+
+            p_dw = tl.make_block_ptr(dw + i_tg * W * D, (W, D), (D, 1), (0, i_d * BD), (W, BD), (1, 0))
+            tl.store(p_dw, b_dw.to(dw.dtype.element_ty))
+        elif i_t * BT >= W:
+            for i_w in tl.static_range(0, W):
+                if is_tail_chunk:
+                    o_t_iw = i_t * BT + i_w + tl.arange(0, BT)
+                    m_t_iw = (o_t_iw >= 0) & (o_t_iw < T_len)
+                    b_dy = tl.load(
+                        dy + bos * D + o_t_iw[:, None] * D + o_d[None, :],
+                        mask=m_t_iw[:, None] & m_d[None, :],
+                        other=0.,
+                    ).to(tl.float32)
+                    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                        b_y = tl.load(
+                            y + bos * D + o_t_iw[:, None] * D + o_d[None, :],
+                            mask=m_t_iw[:, None] & m_d[None, :],
+                            other=0.,
+                        ).to(tl.float32)
+                        b_ys = tl.sigmoid(b_y)
+                        b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+                else:
+                    p_dy = tl.make_block_ptr(
+                        dy + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0),
+                    )
+                    b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+                    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                        p_y = tl.make_block_ptr(
+                            y + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0),
+                        )
+                        b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
+                        b_ys = tl.sigmoid(b_y)
+                        b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+                b_wdy = b_dy
+                if HAS_WEIGHT:
+                    b_wdy = b_wdy * tl.extract_slice(b_w, [W - i_w - 1, 0], [1, BD], [1, 1])
+                    b_dw = tl.sum(b_dy * b_x, 0)
+                    tl.store(dw + i_tg * W * D + (W - i_w - 1) * D + o_d, b_dw.to(dw.dtype.element_ty), mask=m_d)
+                if HAS_BIAS and i_w == 0:
+                    b_db += tl.sum(b_dy, 0)
+                b_dx += b_wdy
+        else:
+            o_t = i_t * BT + tl.arange(0, BT)
+            for i_w in tl.static_range(0, W):
+                if is_tail_chunk:
+                    o_t_iw = i_t * BT + i_w + tl.arange(0, BT)
+                    m_t_iw = (o_t_iw >= 0) & (o_t_iw < T_len)
+                    b_dy_shift = tl.load(
+                        dy + bos * D + o_t_iw[:, None] * D + o_d[None, :],
+                        mask=m_t_iw[:, None] & m_d[None, :],
+                        other=0.,
+                    ).to(tl.float32)
+                    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                        b_y = tl.load(
+                            y + bos * D + o_t_iw[:, None] * D + o_d[None, :],
+                            mask=m_t_iw[:, None] & m_d[None, :],
+                            other=0.,
+                        ).to(tl.float32)
+                        b_ys = tl.sigmoid(b_y)
+                        b_dy_shift = b_dy_shift * b_ys * (1 + b_y * (1 - b_ys))
+                else:
+                    p_dy = tl.make_block_ptr(
+                        dy + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0),
+                    )
+                    b_dy_shift = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+                    if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                        p_y = tl.make_block_ptr(
+                            y + bos * D, (T_len, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0),
+                        )
+                        b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
+                        b_ys = tl.sigmoid(b_y)
+                        b_dy_shift = b_dy_shift * b_ys * (1 + b_y * (1 - b_ys))
+                if HAS_WEIGHT:
+                    b_dw = tl.sum(b_dy_shift * b_x, 0)
+                    if USE_INITIAL_STATE:
+                        mask_head_rows = o_t < i_w
+                        b_dy_head = tl.load(
+                            dy + bos * D + o_t[:, None] * D + o_d,
+                            mask=(mask_head_rows[:, None] & m_d[None, :]),
+                            other=0.,
+                        ).to(tl.float32)
+                        if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                            b_y_head = tl.load(
+                                y + bos * D + o_t[:, None] * D + o_d,
+                                mask=(mask_head_rows[:, None] & m_d[None, :]),
+                                other=0.,
+                            ).to(tl.float32)
+                            b_ys_head = tl.sigmoid(b_y_head)
+                            b_dy_head = b_dy_head * b_ys_head * (1 + b_y_head * (1 - b_ys_head))
+                        o_c = W - i_w + o_t
+                        mask_c = mask_head_rows & (o_c >= 1) & (o_c < W)
+                        b_xc = tl.load(
+                            initial_state + i_n * D * W + o_d[None, :] * W + o_c[:, None],
+                            mask=(mask_c[:, None] & m_d[None, :]),
+                            other=0.,
+                        ).to(tl.float32)
+                        b_dw += tl.sum(b_dy_head * b_xc, 0)
+                    tl.store(dw + i_tg * W * D + (W - i_w - 1) * D + o_d, b_dw.to(dw.dtype.element_ty), mask=m_d)
+
+                if HAS_BIAS and i_w == 0:
+                    b_db += tl.sum(b_dy_shift, 0)
+                if HAS_WEIGHT:
+                    b_wdy = b_dy_shift * tl.extract_slice(b_w, [W - i_w - 1, 0], [1, BD], [1, 1])
+                else:
+                    b_wdy = b_dy_shift
+                b_dx += b_wdy
+
+            if USE_INITIAL_STATE:
+                for i_w in tl.static_range(1, W):
+                    # dh0[i_w] = sum_{t=0}^{i_w-1} dy0[t] * w[i_w-1-t]; load dy0
+                    # row-by-row to avoid overflowing UB with a [BT, BD] preload.
+                    b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
+                    for i_t2 in tl.static_range(0, W - 1):
+                        if i_t2 < i_w:
+                            dy0_row = tl.load(
+                                dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.,
+                            ).to(tl.float32)
+                            if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                                y0_row = tl.load(
+                                    y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.,
+                                ).to(tl.float32)
+                                y0_s = tl.sigmoid(y0_row)
+                                dy0_row = dy0_row * y0_s * (1 + y0_row * (1 - y0_s))
+                            if HAS_WEIGHT:
+                                w_row = tl.extract_slice(b_w, [i_w - 1 - i_t2, 0], [1, BD], [1, 1])
+                                b_dh0_s += tl.sum(dy0_row[None, :] * w_row, 0).to(tl.float32)
+                            else:
+                                b_dh0_s += dy0_row
+                    tl.store(
+                        dh0 + i_t * B * D * W + i_n * D * W + o_d * W + i_w,
+                        b_dh0_s.to(dh0.dtype.element_ty, fp_downcast_rounding='rtne'),
+                        mask=m_d,
+                    )
+
+        if HAS_BIAS:
+            b_db = tl.cast(b_db, dtype=db.dtype.element_ty, fp_downcast_rounding='rtne')
+            tl.store(db + i_tg * D + o_d, b_db, mask=m_d)
+
+        if USE_FINAL_STATE:
+            if i_t * BT + BT >= T_len - W:
+                # final_state[b, d, w] = x[b, T_len-W+w, d] for w in [0, W), so
+                # dx[t] += dht[b, d, t-(T_len-W)] for t in [T_len-W, T_len).
+                row_arange = tl.arange(0, BT)
+                for i_w in tl.static_range(0, W):
+                    target_row = T_len - W + i_w
+                    local_row = target_row - i_t * BT
+                    in_chunk = (local_row >= 0) & (local_row < BT) & (target_row >= 0) & (target_row < T_len)
+                    b_dht_row = tl.load(dht + i_n * D * W + o_d * W + i_w, mask=m_d, other=0.).to(tl.float32)
+                    row_match = (row_arange == local_row) & in_chunk
+                    b_dx += tl.where(row_match[:, None] & m_d[None, :], b_dht_row[None, :], 0.)
+
+        if is_tail_chunk:
+            o_t_dx = i_t * BT + tl.arange(0, BT)
+            m_t_dx = (o_t_dx >= 0) & (o_t_dx < T_len)
+            b_dx_cast = tl.cast(b_dx, dtype=dx.dtype.element_ty, fp_downcast_rounding='rtne')
+            tl.store(
+                dx + bos * D + o_t_dx[:, None] * D + o_d[None, :],
+                b_dx_cast,
+                mask=m_t_dx[:, None] & m_d[None, :],
+            )
+        else:
+            p_dx = tl.make_block_ptr(dx + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
+            tl.store(
+                p_dx, tl.cast(b_dx, dtype=p_dx.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1),
+            )
+
+
 # Ascend Triton rejects grids whose product exceeds 65535 (see fla/modules/token_shift.py).
 _NPU_MAX_TRITON_GRID = 65535
 _ELEM_BLOCK = 2048
@@ -1220,6 +1689,146 @@ def _launch_fwd_core(
     return y
 
 
+def _launch_fwd_coregrid(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    activation: str | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+) -> torch.Tensor:
+    """1D core-grid forward. weight is FLA layout [D, W]."""
+    B, T, D = x.shape
+    W = weight.shape[1]
+    # Kernels expect weight [W, D].
+    weight_wd = weight.transpose(0, 1).contiguous()
+    NUM_CORES = _get_vector_num()
+    BD = _select_coregrid_bd(D, 256)
+    if BD is None:
+        raise RuntimeError(f'coregrid fwd: no aligned BD for D={D}')
+    BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+    NUM_BLKS_D = triton.cdiv(D, BD)
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+        NUM_CHKS = len(chunk_indices)
+    else:
+        chunk_indices = None
+        NUM_CHKS = triton.cdiv(T, BT) * B
+    y = torch.empty_like(x)
+    causal_conv1d_fwd_coregrid_kernel[(NUM_CORES,)](
+        x=x,
+        y=y,
+        weight=weight_wd,
+        bias=bias,
+        residual=residual,
+        cu_seqlens=cu_seqlens,
+        initial_state=None,
+        chunk_indices=chunk_indices,
+        B=B,
+        T=T,
+        D=D,
+        W=W,
+        BT=BT,
+        BD=BD,
+        ACTIVATION=activation,
+        NUM_CHKS=NUM_CHKS,
+        NUM_BLKS_D=NUM_BLKS_D,
+    )
+    return y
+
+
+def _launch_bwd_coregrid(
+    x: torch.Tensor,
+    dy: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    activation: str | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """unified 1D core-grid backward. weight [D, W]."""
+    B, T, D = x.shape
+    W = weight.shape[1] if weight is not None else None
+    weight_wd = weight.transpose(0, 1).contiguous() if weight is not None else None
+    NUM_CORES = _get_vector_num()
+    BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+        NUM_CHKS = len(chunk_indices)
+        NT = len(chunk_indices)
+    else:
+        chunk_indices = None
+        NT = triton.cdiv(T, BT)
+        NUM_CHKS = NT * B
+    has_parallelism = triton.cdiv(D, 64) * NUM_CHKS > NUM_CORES // 2
+    preferred = 64 if has_parallelism else 32
+    BD = _select_coregrid_bd(D, preferred)
+    if BD is None:
+        raise RuntimeError(f'coregrid bwd: no aligned BD for D={D}')
+    NUM_BLKS_D = triton.cdiv(D, BD)
+
+    y = None
+    if activation is not None:
+        y = _launch_fwd_coregrid(
+            x, weight, bias, None, activation=None,
+            cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+        )
+    dx = torch.empty_like(x)
+    dw = weight_wd.new_empty(B * NT, W, D, dtype=torch.float) if weight_wd is not None else None
+    db = bias.new_empty(B * NT, *bias.shape, dtype=torch.float) if bias is not None else None
+    dr = dy if residual is not None else None
+
+    causal_conv1d_bwd_coregrid_kernel[(NUM_CORES,)](
+        x=x,
+        y=y,
+        weight=weight_wd,
+        initial_state=None,
+        dh0=None,
+        dht=None,
+        dy=dy,
+        dx=dx,
+        dw=dw,
+        db=db,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        B=B,
+        T=T,
+        D=D,
+        W=W,
+        BT=BT,
+        BD=BD,
+        ACTIVATION=activation,
+        NUM_BLKS_D=NUM_BLKS_D,
+        NUM_CHKS=NUM_CHKS,
+    )
+    if weight is not None:
+        dw = dw.sum(0).contiguous().to(weight).transpose(0, 1).contiguous()
+    if bias is not None:
+        db = db.sum(0).to(bias)
+    return dx, dw, db, dr
+
+
+def _can_use_coregrid(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    dht: torch.Tensor | None = None,
+    layout_fallback: bool = False,
+) -> bool:
+    if layout_fallback or initial_state is not None or dht is not None:
+        return False
+    if not x.is_contiguous() or x.stride(-1) != 1:
+        return False
+    if residual is not None and (not residual.is_contiguous() or residual.stride(-1) != 1):
+        return False
+    D = x.shape[-1]
+    # Need a usable channel tile (legacy path covers odd D like 200).
+    bd = _select_coregrid_bd(D, 64)
+    return bd is not None and bd >= 16
+
+
 @input_guard(no_guard_contiguous=['x'])
 def causal_conv1d_fwd_npu(
     x: torch.Tensor,
@@ -1235,10 +1844,22 @@ def causal_conv1d_fwd_npu(
     BT: int = 64,
     layout_fallback: bool = False,
 ):
-    del layout_fallback
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
         x = rearrange(x, 'b t ... -> b t (...)')
+    # Fast path: 1D core-grid (large BD + extract_slice).
+    if _can_use_coregrid(x, residual, initial_state, layout_fallback=layout_fallback):
+        y = _launch_fwd_coregrid(
+            x, weight, bias, residual, activation, cu_seqlens, cu_seqlens_cpu,
+        )
+        final_state = None
+        if output_final_state:
+            final_state = causal_conv1d_update_states_npu(
+                x=x, state_len=weight.shape[1], initial_state=initial_state, cu_seqlens=cu_seqlens,
+            )
+        return y.view(shape), final_state
+
+    del layout_fallback
     B, T, D = x.shape[0], x.shape[1], weight.shape[0]
     W = weight.shape[1]
 
@@ -1286,10 +1907,19 @@ def causal_conv1d_bwd_npu(
     BT: int = 64,
     layout_fallback: bool = False,
 ):
-    del layout_fallback
     shape = x.shape
-    if x.shape[-1] != weight.shape[0]:
+    if weight is not None and x.shape[-1] != weight.shape[0]:
         x = rearrange(x, 'b t ... -> b t (...)')
+    if _can_use_coregrid(x, residual, initial_state, dht=dht, layout_fallback=layout_fallback):
+        # Core-grid assumes packed BTD; cheap-copy strided dy from cat/split views.
+        if dy is not None and not dy.is_contiguous():
+            dy = dy.contiguous()
+        dx, dw, db, dr = _launch_bwd_coregrid(
+            x, dy, weight, bias, residual, activation, cu_seqlens, cu_seqlens_cpu,
+        )
+        return dx.view(shape), dw, db, dr, None
+
+    del layout_fallback
     B, T, D = x.shape
     W = weight.shape[1] if weight is not None else None
 

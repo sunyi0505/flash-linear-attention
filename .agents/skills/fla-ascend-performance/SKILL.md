@@ -4,9 +4,10 @@ description: >
   Guidelines for Ascend NPU kernel / Triton-Ascend backend performance work in the FLA repo.
   Covers profiling with torch_npu, PipeUtilization/MemoryUB CSV analysis, Cube/Vector/MTE/UB
   bottleneck diagnosis, and kernel optimization (UB tiling, grid splits, fusion/split, varlen,
-  G_T_CONTIG gate loading, correctness gates). NPU kernels must not use num_warps/num_stages.
-  Use when working on NPU profiling, kernel_details/op_statistic, aic_metrics,
-  fla triton_ascend backends, g transpose stride-1, UB overflow, grid limits, or Ascend performance.
+  G_T_CONTIG gate loading, causal_conv1d 1D core-grid / extract_slice, correctness gates).
+  NPU kernels must not use num_warps/num_stages. Use when working on NPU profiling,
+  kernel_details/op_statistic, aic_metrics, fla triton_ascend backends, g transpose stride-1,
+  causal_conv1d / MindSpeed-style coregrid, UB overflow, grid limits, or Ascend performance.
 ---
 
 # FLA Ascend NPU: Profiling → Bottlenecks → Optimization
@@ -133,7 +134,9 @@ Change only levers that match the bottleneck; one hypothesis per round. Before t
 - **Gate `g` along T (critical on Ascend)**: if `g` is `[B, T, HV]`, host `g.transpose(1, 2).contiguous()` and load via `G_T_CONTIG` + stride-1 `g_ptr` (see [g-contiguous-loading.md](references/g-contiguous-loading.md)). Stride-`HV` gathers in bwd hot loops can be **10×–35× slower** than contiguous loads; HV==1 needs no transpose. Match fwd pointer math; keep `T_seq` before varlen overwrites `T`.
 - Distinct shapes (e.g. `HV==1`, layout flags) get separate paths — no expensive hot-loop branches.
 - Grid product cap `ASCEND_MAX_GRID_DIM=65535`: host-split with `iter_axis_launch_chunks`, pass `*_OFFSET`; after varlen slicing, zero the matching offset — never slice and also add a global offset. UB and grid are independent constraints.
-- **1D core-grid** (prefer when there are many independent tiles and multi-axis grids need host chunking): launch `grid=(num_aicore,)` from `driver.active.utils.get_device_properties(device)["num_aicore"]`, flatten work into `task_num`, and schedule with `for task_id in tl.range(core_id, task_num, num_core)`. Decode `task_id` → tile indices inside the kernel. One launch, no `ASCEND_MAX_GRID_DIM` host loop, better load balance when `task_num` is irregular (varlen chunks × heads × V tiles). Keep `do_not_specialize` on `T` / `task_num` / `num_core` / dynamic extents.
+- **1D core-grid** (prefer when there are many independent tiles and multi-axis grids need host chunking): flatten work into `task_num` and schedule with `for task_id in range(pid, task_num, num_programs)` (or `tl.range`). Decode `task_id` → tile indices inside the kernel. One launch, no `ASCEND_MAX_GRID_DIM` host loop, better load balance when `task_num` is irregular (varlen chunks × heads × V tiles). Keep `do_not_specialize` on `T` / `task_num` / `num_core` / dynamic extents.
+  - Cube / matmul-heavy ops: `grid=(num_aicore,)`.
+  - Vector-bound ops (e.g. depthwise `causal_conv1d`): `grid=(num_vectorcore,)`, large channel BD that **exactly divides D**, tap-wise `extract_slice` — see [causal-conv1d-coregrid.md](references/causal-conv1d-coregrid.md).
 - In a core-grid task loop, **rebind local pointers each iteration** (`q_ptr = q + …`); do not accumulate with in-place `ptr +=` across tasks — Ascend Triton can mis-compile that pattern.
 - **int64 before multiply on runtime indices**: with `do_not_specialize` on `T`, values like `NT = cdiv(T, BT)` are runtime int32. `(NT - 1) * DH_CS` or `i_t * HV * K * V` can wrap past 2³¹ before `.to(tl.int64)` (e.g. K=V=128, HV=64 overflows at T>131K). Cast the index first: `(NT - 1).to(tl.int64) * DH_CS`, not `((NT - 1) * DH_CS).to(tl.int64)`.
 - Reductions / recurrence / grads use fp32 accum, cast on store; sensitive solves: `input_precision='ieee'` / `allow_tf32=False`; mask before exp on gated paths; keep a consistent `exp`/`exp2` base.
@@ -183,7 +186,7 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - [ ] No `num_warps` / `num_stages` in Ascend kernel launches, autotune configs, or wrappers
 - [ ] Backend registration, lazy import, public signatures correct
 - [ ] Peak live tiles estimated; tiles from shared helpers + safety margin
-- [ ] Grid ≤ 65535 **or** 1D core-grid (`num_aicore`); host-split offsets not double-counted with varlen; task-loop pointers rebound each iteration
+- [ ] Grid ≤ 65535 **or** 1D core-grid (`num_aicore` / Vector ops: `num_vectorcore`); host-split offsets not double-counted with varlen; task-loop pointers rebound each iteration; channel BD exact-divisor when required (causal_conv)
 - [ ] Block pointers contiguous innermost; **gate `g` uses G_T_CONTIG** when `[B,T,HV]` (see [g-contiguous-loading.md](references/g-contiguous-loading.md)); tail `boundary_check`
 - [ ] fp32 accum consistent with output/exp base; fusion worth the complexity (no gratuitous `ACCUMULATE_OUTPUT` writeback when UB allows)
 - [ ] fwd/bwd/varlen/layout branches covered; no unwritten regions under NaN poisoning
@@ -208,4 +211,5 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - Metrics, failure modes, code index: [references/reference.md](references/reference.md)
 - Past kernel case notes: [references/cases.md](references/cases.md)
 - **Gate `g` stride-1 loading (G_T_CONTIG)**: [g-contiguous-loading.md](references/g-contiguous-loading.md)
+- **`causal_conv1d` 1D core-grid / extract_slice**: [causal-conv1d-coregrid.md](references/causal-conv1d-coregrid.md)
 - Ad-hoc workload output dir: `npu_prof/` (new collection must use the generic scripts)

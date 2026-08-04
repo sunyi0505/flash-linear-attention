@@ -21,3 +21,13 @@ File: `fla/ops/common/backends/triton_ascend/chunk_o.py`
 - Fwd: fuse inter+intra, 1D core-grid, host `g.transpose(1,2).contiguous()`.
 - Bwd `G_T_CONTIG`: `chunk_bwd_dv_local_npu`, `chunk_bwd_dqkwg_npu`, `chunk_bwd_kernel_dg_npu` — stride-1 `g_ptr` (`i_b*HV*T+i_h*T` / varlen `bos+i_h*T`), `T_seq` before varlen.
 - dv_local kernel ~6.5→0.18ms, dqkwg ~10.8→0.91ms (B2 T2048 HV8). Fix `BV`, autotune `BK`. Details: [g-contiguous-loading.md](g-contiguous-loading.md).
+
+## `causal_conv1d.py` — MindSpeed-style 1D core-grid
+
+File: `fla/modules/backends/triton_ascend/causal_conv1d.py`
+
+- Hot path: `num_vectorcore` 1D core-grid (Vector-bound, not Cube `num_aicore`), BD up to 256 fwd / 64|32 bwd, host weight `[D,W]→[W,D]`, tap-wise `extract_slice`/`insert_slice`, fuse bias+silu+residual, unified bwd.
+- Gate: contiguous BTD, no `initial_state`/`dht`, **BD must exactly divide D** (odd D e.g. 200 → legacy); force `dy.contiguous()` when gated.
+- Tail chunks: masked loads/stores when block end exceeds `B*T` (block_ptr MTE DDR OOB otherwise).
+- Measured bf16 fwdbwd: T2048 D1024 ~3.3→0.5–0.7ms; T8192 D4096 ~52→1.6ms. Gate: `tests/modules/test_conv.py -k "not cuda"`.
+- Details: [causal-conv1d-coregrid.md](causal-conv1d-coregrid.md).

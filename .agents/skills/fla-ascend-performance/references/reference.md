@@ -49,7 +49,8 @@ After changing `mem_mult`/tiles, always re-check compile + numeric correctness.
 ## Common failures and fixes
 
 - **UB overflow**: fewer concurrent fp32 tiles; smaller BK/BV; split kernels; avoid accidental large broadcasts.
-- **Grid limit**: host-split axes + offsets, **or** switch to 1D core-grid (`num_aicore` × flat `task_num`); do not only grow tiles.
+- **Grid limit**: host-split axes + offsets, **or** switch to 1D core-grid (`num_aicore` / Vector: `num_vectorcore` × flat `task_num`); do not only grow tiles.
+- **causal_conv core-grid wrong `dw` / DDR OOB**: require `D % BD == 0`; use masked loads on tail chunks past `B*T`; force contiguous `dy` when gated — see [causal-conv1d-coregrid.md](causal-conv1d-coregrid.md).
 - **Varlen wrong only on long seqs**: after slicing `chunk_indices`, check for a second global `NT_OFFSET`; on core-grid paths, verify `chunk_offsets` → `(i_n, i_t)` against `cu_seqlens`.
 - **Wrong results only in multi-task core-grid loops**: rebind local base pointers each `task_id`; avoid in-place `ptr +=` across iterations.
 - **Occasional bf16 NaN**: mask before exp, fp32 accum, exp/exp2 scale, solve precision.
@@ -77,6 +78,7 @@ Paths relative to the `flash-linear-attention` repo root. Detailed case notes: [
 - `fla/ops/common/backends/triton_ascend/chunk_scaled_dot_kkt.py` — peak tile, BC, UB-safe BK
 - `fla/ops/common/backends/triton_ascend/chunk_delta_h.py` — fwd recurrence, V tiling, bwd `dhu` (see [cases.md](cases.md))
 - `fla/ops/common/backends/triton_ascend/chunk_o.py` — fwd fuse + bwd G_T_CONTIG (see [cases.md](cases.md))
+- `fla/modules/backends/triton_ascend/causal_conv1d.py` — Vector `num_vectorcore` 1D core-grid, exact-divisor BD, `extract_slice` (see [causal-conv1d-coregrid.md](causal-conv1d-coregrid.md))
 - `fla/ops/gated_delta_rule/backends/triton_ascend/wy_fast.py` — different fwd/bwd `mem_mult`; multi-stage bwd
 - `fla/ops/utils/backends/triton_ascend/cumsum.py` — scalar/vector split and leftover UB budget
 
