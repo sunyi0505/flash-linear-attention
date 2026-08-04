@@ -12,6 +12,10 @@ cannot bind tuple arguments, so sources are stacked in L-chunks as
 ``[L_chunk, N, D]`` (capped at 512 MiB per chunk) instead of one ``[L, N, D]``
 buffer. Cross-chunk softmax stats are merged on the host; the weighted sum
 accumulates in a single fp32 ``o_mix`` buffer to match GPU register precision.
+
+Per-N forward/backward Triton kernels mirror the CUDA structure: when
+``BD >= D`` each L tile loads ``v`` once and uses ``tl.dot`` for D reductions.
+Cross-chunk softmax stats and ``o_mix`` are merged on the host.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from fla.utils.ascend_ub_manager import (
     iter_axis_launch_chunks,
 )
 
-_FWD_MEM_MULT = 3.0
+_FWD_MEM_MULT = 4.0
 _BWD_DV_MEM_MULT = 6.0
 _SAFETY_MARGIN = 0.85
 _FALLBACK_BD = 256
@@ -65,15 +69,20 @@ def _iter_l_chunks(
         yield l0, l1 - l0, _stack_sources(sources, l0, l1), stride_ln, N, D
 
 
-def _merge_online_softmax(
+def _merge_online_softmax_o(
     m: torch.Tensor,
     acc: torch.Tensor,
+    o: torch.Tensor,
     m_chunk: torch.Tensor,
     acc_chunk: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    o_chunk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m_new = torch.maximum(m, m_chunk)
-    acc_new = acc * torch.exp(m - m_new) + acc_chunk * torch.exp(m_chunk - m_new)
-    return m_new, acc_new
+    scale_old = torch.exp(m - m_new)
+    scale_chunk = torch.exp(m_chunk - m_new)
+    acc_new = acc * scale_old + acc_chunk * scale_chunk
+    o_new = o * scale_old.unsqueeze(-1) + o_chunk * scale_chunk.unsqueeze(-1)
+    return m_new, acc_new, o_new
 
 
 def _get_bl(L: int) -> int:
@@ -94,9 +103,11 @@ def _get_bd(row_dim: int, col_dim: int, *, memory_multiplier: float) -> int:
     )
 
 
-def _get_bl_bd(ll: int, D: int, *, mem_mult: float) -> tuple[int, int]:
+def _get_bl_bd(ll: int, D: int, *, mem_mult: float) -> tuple[int, int, bool]:
     bl = _get_bl(ll)
-    return bl, _get_bd(bl, D, memory_multiplier=mem_mult)
+    bd = _get_bd(bl, D, memory_multiplier=mem_mult)
+    bd = min(bd, triton.next_power_of_2(D))
+    return bl, bd, bd >= D
 
 
 def _launch_n(
@@ -110,14 +121,14 @@ def _launch_n(
 
 
 @triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
-def attnres_fwd_p1_chunk_kernel(
-    q,
+def attnres_fwd_chunk_kernel(
+    qw,
     res,
-    w,
     rstd,
     logit,
     chunk_m,
     chunk_acc,
+    chunk_o,
     L,
     N,
     D,
@@ -126,81 +137,81 @@ def attnres_fwd_p1_chunk_kernel(
     scale,
     BL: tl.constexpr,
     BD: tl.constexpr,
+    SINGLE_D_TILE: tl.constexpr,
     L_OFFSET,
     N_OFFSET: tl.constexpr,
 ):
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
     b_m = tl.full([], float('-inf'), dtype=tl.float32)
     b_acc = tl.zeros([], dtype=tl.float32)
-    for i_l in range(tl.cdiv(L, BL)):
-        o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
-        m_l = o_l < L
-        b_v_sq = tl.zeros([BL], dtype=tl.float32)
-        b_v_qw = tl.zeros([BL], dtype=tl.float32)
-        for i_d in range(tl.cdiv(D, BD)):
-            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-            m_d = o_d < D
-            b_qw = (
-                tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
-                * tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
-            )
-            b_v = tl.load(
-                res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                mask=m_l[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            b_v_sq += tl.sum(b_v * b_v, axis=1)
-            b_v_qw += tl.sum(b_v * b_qw[None, :], axis=1)
-        b_rstd = tl.rsqrt(b_v_sq / D + eps)
-        b_logit = b_v_qw * b_rstd
-        b_s = tl.where(m_l, b_logit * scale, float('-inf'))
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
-        b_acc = b_acc * exp(b_mp - b_m) + tl.sum(exp(b_s - b_m), axis=0)
-        g_l = L_OFFSET + o_l
-        tl.store(rstd + g_l * N + i_n, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
-        tl.store(logit + g_l * N + i_n, b_logit.to(logit.dtype.element_ty), mask=m_l)
-    tl.store(chunk_m + i_n, b_m)
-    tl.store(chunk_acc + i_n, b_acc)
-
-
-@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
-def attnres_fwd_p2_chunk_kernel(
-    res,
-    logit,
-    lse,
-    o_mix,
-    L,
-    N,
-    D,
-    stride_ln,
-    scale,
-    BL: tl.constexpr,
-    BD: tl.constexpr,
-    L_OFFSET,
-    N_OFFSET: tl.constexpr,
-    ACCUM: tl.constexpr,
-):
-    i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
-    b_lse = tl.load(lse + i_n).to(tl.float32)
-    for i_d in range(tl.cdiv(D, BD)):
-        o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+    if SINGLE_D_TILE:
+        o_d = tl.arange(0, BD).to(tl.int64)
         m_d = o_d < D
-        b_o = tl.zeros([BD], dtype=tl.float32)
+        b_qw = tl.load(qw + o_d, mask=m_d, other=0.).to(tl.float32)
         for i_l in range(tl.cdiv(L, BL)):
             o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
             m_l = o_l < L
             g_l = L_OFFSET + o_l
-            b_logit = tl.load(logit + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
-            b_p = tl.where(m_l, exp(b_logit * scale - b_lse), 0.0)
+            m_v = m_l[:, None] & m_d[None, :]
             b_v = tl.load(
                 res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                mask=m_l[:, None] & m_d[None, :],
+                mask=m_v,
                 other=0.0,
             ).to(tl.float32)
-            b_o += tl.sum(b_p[:, None] * b_v, axis=0)
-        if ACCUM:
-            b_o += tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-        tl.store(o_mix + i_n * D + o_d, b_o, mask=m_d)
+            b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) / D + eps)
+            b_logit = tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd
+            b_s = tl.where(m_l, b_logit * scale, float('-inf'))
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+            b_r = exp(b_mp - b_m)
+            b_p = exp(b_s - b_m)
+            b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+            b_o_slice = tl.sum(b_p[:, None] * b_v, axis=0)
+            p_o = chunk_o + i_n * D + o_d
+            b_o = tl.load(p_o, mask=m_d, other=0.).to(tl.float32) * b_r + b_o_slice
+            tl.store(p_o, b_o, mask=m_d)
+            tl.store(rstd + g_l * N + i_n, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
+            tl.store(logit + g_l * N + i_n, b_logit.to(logit.dtype.element_ty), mask=m_l)
+    else:
+        for i_l in range(tl.cdiv(L, BL)):
+            o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
+            m_l = o_l < L
+            g_l = L_OFFSET + o_l
+            b_v_sq = tl.zeros([BL], dtype=tl.float32)
+            b_v_qw = tl.zeros([BL], dtype=tl.float32)
+            for i_d in range(tl.cdiv(D, BD)):
+                o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+                m_d = o_d < D
+                b_qw = tl.load(qw + o_d, mask=m_d, other=0.).to(tl.float32)
+                b_v = tl.load(
+                    res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
+                    mask=m_l[:, None] & m_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                b_v_sq += tl.sum(b_v * b_v, axis=1)
+                b_v_qw += tl.sum(b_v * b_qw[None, :], axis=1)
+            b_rstd = tl.rsqrt(b_v_sq / D + eps)
+            b_logit = b_v_qw * b_rstd
+            b_s = tl.where(m_l, b_logit * scale, float('-inf'))
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+            b_r = exp(b_mp - b_m)
+            b_p = exp(b_s - b_m)
+            b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+            for i_d in range(tl.cdiv(D, BD)):
+                o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+                m_d = o_d < D
+                b_v = tl.load(
+                    res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
+                    mask=m_l[:, None] & m_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                b_o_slice = tl.sum(b_p[:, None] * b_v, axis=0)
+                p_o = chunk_o + i_n * D + o_d
+                b_o = tl.load(p_o, mask=m_d, other=0.).to(tl.float32) * b_r + b_o_slice
+                tl.store(p_o, b_o, mask=m_d)
+            tl.store(rstd + g_l * N + i_n, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
+            tl.store(logit + g_l * N + i_n, b_logit.to(logit.dtype.element_ty), mask=m_l)
+    tl.store(chunk_m + i_n, b_m)
+    tl.store(chunk_acc + i_n, b_acc)
 
 
 @triton.jit(do_not_specialize=['N', 'D'])
@@ -230,22 +241,38 @@ def attnres_fwd_onorm_kernel(
         tl.store(o + i_n * D + o_d, (b_o * b_o_rstd * b_ow).to(o.dtype.element_ty), mask=m_d)
 
 
-@triton.jit(do_not_specialize=['N', 'D'])
-def attnres_bwd_prep_kernel(
+@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
+def attnres_bwd_dv_chunk_kernel(
+    qw,
+    res,
     ow,
-    o_mix,
+    rstd,
+    logit,
+    lse,
     do,
     do_eff,
+    o_mix,
+    ds_scratch,
+    p_scratch,
     dow_partial,
-    b_delta,
+    dres,
+    dqw,
+    L,
     N,
     D,
+    stride_ln,
     eps,
+    scale,
+    BL: tl.constexpr,
     BD: tl.constexpr,
     HAS_ONORM: tl.constexpr,
+    SINGLE_D_TILE: tl.constexpr,
+    L_OFFSET,
     N_OFFSET: tl.constexpr,
 ):
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
+    b_lse = tl.load(lse + i_n).to(tl.float32)
+
     if HAS_ONORM:
         b_o_sq = tl.zeros([], dtype=tl.float32)
         for i_d in range(tl.cdiv(D, BD)):
@@ -263,48 +290,66 @@ def attnres_bwd_prep_kernel(
             b_ow = tl.load(ow + o_d, mask=m_d, other=0.).to(tl.float32)
             b_c1 += tl.sum(tl.where(m_d, b_o_pre * b_o_rstd * b_ow * b_do, 0.0), axis=0)
         b_c1 /= D
-
-    b_delta_acc = tl.zeros([], dtype=tl.float32)
-    for i_d in range(tl.cdiv(D, BD)):
-        o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-        m_d = o_d < D
-        b_do = tl.load(do + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-        b_o_pre = tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-        if HAS_ONORM:
+        b_delta_val = tl.zeros([], dtype=tl.float32)
+        for i_d in range(tl.cdiv(D, BD)):
+            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+            m_d = o_d < D
+            b_do = tl.load(do + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+            b_o_pre = tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
             b_ow = tl.load(ow + o_d, mask=m_d, other=0.).to(tl.float32)
             b_xhat = b_o_pre * b_o_rstd
             tl.store(dow_partial + i_n * D + o_d, (b_xhat * b_do).to(dow_partial.dtype.element_ty), mask=m_d)
             b_do = (b_ow * b_do - b_xhat * b_c1) * b_o_rstd
-        tl.store(do_eff + i_n * D + o_d, b_do, mask=m_d)
-        b_delta_acc += tl.sum(tl.where(m_d, b_do * b_o_pre, 0.0), axis=0)
-    tl.store(b_delta + i_n, b_delta_acc)
+            tl.store(do_eff + i_n * D + o_d, b_do, mask=m_d)
+            b_delta_val += tl.sum(tl.where(m_d, b_do * b_o_pre, 0.0), axis=0)
+    else:
+        b_delta_val = tl.zeros([], dtype=tl.float32)
+        for i_d in range(tl.cdiv(D, BD)):
+            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+            m_d = o_d < D
+            b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+            b_o_pre = tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+            b_delta_val += tl.sum(tl.where(m_d, b_do * b_o_pre, 0.0), axis=0)
 
+    if SINGLE_D_TILE:
+        o_d = tl.arange(0, BD).to(tl.int64)
+        m_d = o_d < D
+        b_qw = tl.load(qw + o_d, mask=m_d, other=0.).to(tl.float32)
+        b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+        b_dqw = tl.zeros([BD], dtype=tl.float32)
+        for i_l in range(tl.cdiv(L, BL)):
+            o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
+            m_l = o_l < L
+            g_l = L_OFFSET + o_l
+            m_v = m_l[:, None] & m_d[None, :]
+            b_v = tl.load(
+                res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
+                mask=m_v,
+                other=0.0,
+            ).to(tl.float32)
+            b_rstd = tl.load(rstd + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
+            b_logit = tl.load(logit + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
+            b_p = tl.where(m_l, exp(b_logit * scale - b_lse), 0.0)
+            b_dp = tl.sum(b_v * b_do[None, :], axis=1)
+            b_ds = b_p * (b_dp - b_delta_val) * scale
+            b_k = b_v * b_rstd[:, None]
+            b_dv = b_p[:, None] * b_do[None, :] + (b_ds * b_rstd)[:, None] * (
+                b_qw[None, :] - b_k * (b_logit / D)[:, None]
+            )
+            tl.store(
+                dres + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
+                b_dv.to(dres.dtype.element_ty),
+                mask=m_v,
+            )
+            b_dqw += tl.sum(b_ds[:, None] * b_k, axis=0)
+        p_dqw = dqw + i_n * D + o_d
+        tl.store(
+            p_dqw,
+            tl.load(p_dqw, mask=m_d, other=0.).to(tl.float32) + b_dqw,
+            mask=m_d,
+        )
+        return
 
-@triton.jit(do_not_specialize=['L', 'N', 'D', 'L_OFFSET'])
-def attnres_bwd_dv_chunk_kernel(
-    q,
-    res,
-    w,
-    rstd,
-    logit,
-    lse,
-    do_eff,
-    dres,
-    dqw,
-    b_delta,
-    L,
-    N,
-    D,
-    stride_ln,
-    scale,
-    BL: tl.constexpr,
-    BD: tl.constexpr,
-    L_OFFSET,
-    N_OFFSET: tl.constexpr,
-):
-    i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
-    b_lse = tl.load(lse + i_n).to(tl.float32)
-    b_delta = tl.load(b_delta + i_n).to(tl.float32)
     for i_l in range(tl.cdiv(L, BL)):
         o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
         m_l = o_l < L
@@ -323,21 +368,29 @@ def attnres_bwd_dv_chunk_kernel(
                 other=0.0,
             ).to(tl.float32)
             b_dp += tl.sum(b_v * b_do[None, :], axis=1)
-        b_ds = b_p * (b_dp - b_delta) * scale
-        for i_d in range(tl.cdiv(D, BD)):
-            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-            m_d = o_d < D
+        b_ds = b_p * (b_dp - b_delta_val) * scale
+        tl.store(ds_scratch + o_l * N + i_n, b_ds, mask=m_l)
+        tl.store(p_scratch + o_l * N + i_n, b_p, mask=m_l)
+
+    for i_d in range(tl.cdiv(D, BD)):
+        o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+        m_d = o_d < D
+        b_qw = tl.load(qw + o_d, mask=m_d, other=0.).to(tl.float32)
+        b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+        b_dqw = tl.zeros([BD], dtype=tl.float32)
+        for i_l in range(tl.cdiv(L, BL)):
+            o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
+            m_l = o_l < L
             m_v = m_l[:, None] & m_d[None, :]
-            b_qw = (
-                tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
-                * tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
-            )
-            b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+            b_p = tl.load(p_scratch + o_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
+            b_ds = tl.load(ds_scratch + o_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
             b_v = tl.load(
                 res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
                 mask=m_v,
                 other=0.0,
             ).to(tl.float32)
+            b_rstd = tl.load(rstd + (L_OFFSET + o_l) * N + i_n, mask=m_l, other=0.).to(tl.float32)
+            b_logit = tl.load(logit + (L_OFFSET + o_l) * N + i_n, mask=m_l, other=0.).to(tl.float32)
             b_k = b_v * b_rstd[:, None]
             b_dv = b_p[:, None] * b_do[None, :] + (b_ds * b_rstd)[:, None] * (
                 b_qw[None, :] - b_k * (b_logit / D)[:, None]
@@ -347,9 +400,13 @@ def attnres_bwd_dv_chunk_kernel(
                 b_dv.to(dres.dtype.element_ty),
                 mask=m_v,
             )
-            b_dqw = tl.load(dqw + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
             b_dqw += tl.sum(b_ds[:, None] * b_k, axis=0)
-            tl.store(dqw + i_n * D + o_d, b_dqw, mask=m_d)
+        p_dqw = dqw + i_n * D + o_d
+        tl.store(
+            p_dqw,
+            tl.load(p_dqw, mask=m_d, other=0.).to(tl.float32) + b_dqw,
+            mask=m_d,
+        )
 
 
 @triton.jit(do_not_specialize=['N', 'D'])
@@ -383,42 +440,15 @@ def attnres_bwd_kernel_dqdw_npu(
         tl.store(dow + o_d, b_dow, mask=m_d)
 
 
-def _get_o_mix(
-    sources: Sequence[torch.Tensor],
-    logit: torch.Tensor,
-    lse: torch.Tensor,
-    scale: float,
-    device: torch.device,
-    o_pre: torch.Tensor | None = None,
-    o_mix: torch.Tensor | None = None,
+def _resolve_o_mix(
+    o_pre: torch.Tensor | None,
+    o_mix_saved: torch.Tensor,
 ) -> torch.Tensor:
+    if o_mix_saved.numel() > 0:
+        return o_mix_saved
     if o_pre is not None:
-        return o_pre
-    if o_mix is None:
-        o_mix = torch.zeros(*sources[0].shape, device=device, dtype=torch.float32)
-    first = True
-    for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
-        bl, bd = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
-        _launch_n(
-            attnres_fwd_p2_chunk_kernel,
-            N,
-            res=chunk,
-            logit=logit,
-            lse=lse,
-            o_mix=o_mix,
-            L=ll,
-            N=N,
-            D=D,
-            stride_ln=stride_ln,
-            scale=scale,
-            BL=bl,
-            BD=bd,
-            L_OFFSET=l0,
-            ACCUM=not first,
-        )
-        first = False
-        del chunk
-    return o_mix
+        return o_pre.float()
+    raise RuntimeError('attnres bwd requires either o_pre or saved o_mix')
 
 
 def _dres_chunk(
@@ -443,33 +473,37 @@ def fused_attnres_fwd_npu(
     eps: float,
     scale: float,
     checkpoint_level: int,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     L, N, D = len(sources), *sources[0].shape
     dtype = sources[0].dtype
     save_opre = checkpoint_level == 0
+    save_o_mix = checkpoint_level == 1
 
     o = torch.empty((N, D), device=sources[0].device, dtype=dtype)
     o_pre = torch.empty((N, D), device=sources[0].device, dtype=dtype) if save_opre else None
+    o_mix = torch.zeros((N, D), device=sources[0].device, dtype=torch.float32)
     lse = torch.empty(N, device=sources[0].device, dtype=torch.float32)
     rstd = torch.empty((L, N), device=sources[0].device, dtype=torch.float32)
     logit = torch.empty_like(rstd)
+    qw = q.float() * w.float()
 
     m = torch.full((N,), float('-inf'), device=sources[0].device, dtype=torch.float32)
     acc = torch.zeros(N, device=sources[0].device, dtype=torch.float32)
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
         chunk_m = torch.empty(N, device=chunk.device, dtype=torch.float32)
         chunk_acc = torch.empty(N, device=chunk.device, dtype=torch.float32)
-        bl, bd = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
+        chunk_o = torch.zeros(N, D, device=chunk.device, dtype=torch.float32)
+        bl, bd, single_d = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
         _launch_n(
-            attnres_fwd_p1_chunk_kernel,
+            attnres_fwd_chunk_kernel,
             N,
-            q=q,
+            qw=qw,
             res=chunk,
-            w=w,
             rstd=rstd,
             logit=logit,
             chunk_m=chunk_m,
             chunk_acc=chunk_acc,
+            chunk_o=chunk_o,
             L=ll,
             N=N,
             D=D,
@@ -478,13 +512,15 @@ def fused_attnres_fwd_npu(
             scale=scale,
             BL=bl,
             BD=bd,
+            SINGLE_D_TILE=single_d,
             L_OFFSET=l0,
         )
-        m, acc = _merge_online_softmax(m, acc, chunk_m, chunk_acc)
-        del chunk, chunk_m, chunk_acc
+        m, acc, o_mix = _merge_online_softmax_o(m, acc, o_mix, chunk_m, chunk_acc, chunk_o)
+        del chunk, chunk_m, chunk_acc, chunk_o
 
     lse.copy_(m + torch.log(acc))
-    o_mix = _get_o_mix(sources, logit, lse, scale, sources[0].device)
+    o_mix.div_(acc.unsqueeze(-1))
+    o_mix_saved = o_mix if save_o_mix else torch.empty(0, device=o.device, dtype=torch.float32)
 
     if save_opre:
         o_pre.copy_(o_mix.to(dtype))
@@ -504,7 +540,7 @@ def fused_attnres_fwd_npu(
             eps=eps,
             BD=_get_bd(1, D, memory_multiplier=2.0),
         )
-    return o, o_pre, rstd, logit, lse
+    return o, o_pre, o_mix_saved, rstd, logit, lse
 
 
 def fused_attnres_bwd_npu(
@@ -514,6 +550,7 @@ def fused_attnres_bwd_npu(
     w: torch.Tensor,
     ow: torch.Tensor | None,
     o_pre: torch.Tensor | None,
+    o_mix_saved: torch.Tensor,
     rstd: torch.Tensor,
     logit: torch.Tensor,
     lse: torch.Tensor,
@@ -527,54 +564,56 @@ def fused_attnres_bwd_npu(
     flat_dvs: list[torch.Tensor | None] = [None] * len(sources)
 
     do_eff = torch.empty_like(do, dtype=torch.float32)
-    b_delta = torch.empty(N, device=do.device, dtype=torch.float32)
     dqw = torch.zeros_like(do, dtype=torch.float32)
     dq, dw = torch.empty_like(q), torch.empty_like(w)
     dow = torch.empty_like(ow) if has_onorm else None
     dow_partial = torch.empty_like(do, dtype=torch.float32) if has_onorm else do_eff
+    scratch_stub = torch.empty(1, device=do.device, dtype=torch.float32)
+    qw = q.float() * w.float()
 
-    o_mix = _get_o_mix(sources, logit, lse, scale, do.device, o_pre=o_pre)
-    _launch_n(
-        attnres_bwd_prep_kernel,
-        N,
-        ow=ow if ow is not None else w,
-        o_mix=o_mix,
-        do=do,
-        do_eff=do_eff,
-        dow_partial=dow_partial,
-        b_delta=b_delta,
-        N=N,
-        D=D,
-        eps=eps,
-        BD=_get_bd(1, D, memory_multiplier=_BWD_DV_MEM_MULT),
-        HAS_ONORM=has_onorm,
-    )
+    o_mix = _resolve_o_mix(o_pre, o_mix_saved)
+    if not has_onorm:
+        do_eff.copy_(do)
 
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
         dres = _dres_chunk(flat_dvs, sources, l0, ll, chunk)
-        bl, bd = _get_bl_bd(ll, D, mem_mult=_BWD_DV_MEM_MULT)
+        bl, bd, single_d = _get_bl_bd(ll, D, mem_mult=_BWD_DV_MEM_MULT)
+        if single_d:
+            ds_scratch = p_scratch = scratch_stub
+        else:
+            ds_scratch = torch.empty(ll, N, device=chunk.device, dtype=torch.float32)
+            p_scratch = torch.empty(ll, N, device=chunk.device, dtype=torch.float32)
         _launch_n(
             attnres_bwd_dv_chunk_kernel,
             N,
-            q=q,
+            qw=qw,
             res=chunk,
-            w=w,
+            ow=ow if ow is not None else qw,
             rstd=rstd,
             logit=logit,
             lse=lse,
+            do=do,
             do_eff=do_eff,
+            o_mix=o_mix,
+            ds_scratch=ds_scratch,
+            p_scratch=p_scratch,
+            dow_partial=dow_partial,
             dres=dres,
             dqw=dqw,
-            b_delta=b_delta,
             L=ll,
             N=N,
             D=D,
             stride_ln=stride_ln,
+            eps=eps,
             scale=scale,
             BL=bl,
             BD=bd,
+            HAS_ONORM=has_onorm,
+            SINGLE_D_TILE=single_d,
             L_OFFSET=l0,
         )
+        if not single_d:
+            del ds_scratch, p_scratch
         if ll > 1:
             for i in range(ll):
                 idx = l0 + i
@@ -618,12 +657,12 @@ class FusedAttnresNpuFunction(torch.autograd.Function):
         checkpoint_level: int,
         *residuals: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        o, o_pre, rstd, logit, lse = fused_attnres_fwd_npu(
+        o, o_pre, o_mix_saved, rstd, logit, lse = fused_attnres_fwd_npu(
             query, residuals, rms_weight, output_rms_weight,
             rms_eps, scale, checkpoint_level,
         )
         ctx.save_for_backward(
-            query, rms_weight, output_rms_weight, o_pre, rstd, logit, lse, *residuals,
+            query, rms_weight, output_rms_weight, o_pre, o_mix_saved, rstd, logit, lse, *residuals,
         )
         ctx.eps, ctx.scale, ctx.checkpoint_level = rms_eps, scale, checkpoint_level
         p = (logit * scale - lse).exp() if return_weights else o.new_empty(0)
@@ -635,10 +674,10 @@ class FusedAttnresNpuFunction(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, do: torch.Tensor, dp: torch.Tensor | None = None):
         del dp
-        query, rms_weight, output_rms_weight, o_pre, rstd, logit, lse, *residuals = ctx.saved_tensors
+        query, rms_weight, output_rms_weight, o_pre, o_mix_saved, rstd, logit, lse, *residuals = ctx.saved_tensors
         dq, dw, dow, flat_dvs = fused_attnres_bwd_npu(
             do, query, residuals, rms_weight, output_rms_weight,
-            o_pre, rstd, logit, lse, ctx.eps, ctx.scale, ctx.checkpoint_level,
+            o_pre, o_mix_saved, rstd, logit, lse, ctx.eps, ctx.scale, ctx.checkpoint_level,
         )
         return (dq, dw, dow, None, None, None, None, *flat_dvs)
 
