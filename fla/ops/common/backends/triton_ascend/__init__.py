@@ -23,10 +23,20 @@ class TritonAscendCommonBackend(BaseBackend):
         from fla.utils import IS_NPU
         return IS_NPU
 
+    def _mso_common(self):
+        from fla.ops.backends.triton_ascend_variant import use_mindspeed_ops
+        if use_mindspeed_ops():
+            import fla.ops.common.backends.triton_ascend.mindspeed_ops as mso
+            return mso
+        return None
+
     def chunk_scaled_dot_kkt_fwd_verifier(self, *args, **kwargs):
         return True, None
 
     def chunk_scaled_dot_kkt_fwd(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_scaled_dot_kkt_fwd_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_npu
         return chunk_scaled_dot_kkt_fwd_npu(*args, **kwargs)
 
@@ -34,6 +44,9 @@ class TritonAscendCommonBackend(BaseBackend):
         return True, None
 
     def chunk_gated_delta_rule_fwd_h(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_gated_delta_rule_fwd_h_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_delta_h import chunk_gated_delta_rule_fwd_h_npu
         return chunk_gated_delta_rule_fwd_h_npu(*args, **kwargs)
 
@@ -41,6 +54,9 @@ class TritonAscendCommonBackend(BaseBackend):
         return True, None
 
     def chunk_fwd_o(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_fwd_o_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_o import chunk_fwd_o_npu
         return chunk_fwd_o_npu(*args, **kwargs)
 
@@ -48,6 +64,9 @@ class TritonAscendCommonBackend(BaseBackend):
         return True, None
 
     def chunk_bwd_dv_local(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_bwd_dv_local_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_o import chunk_bwd_dv_local_npu
         return chunk_bwd_dv_local_npu(*args, **kwargs)
 
@@ -55,6 +74,9 @@ class TritonAscendCommonBackend(BaseBackend):
         return True, None
 
     def chunk_bwd_dqkwg(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_bwd_dqkwg_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_o import chunk_bwd_dqkwg_npu
         return chunk_bwd_dqkwg_npu(*args, **kwargs)
 
@@ -62,6 +84,9 @@ class TritonAscendCommonBackend(BaseBackend):
         return True, None
 
     def chunk_gated_delta_rule_bwd_dhu(self, *args, **kwargs):
+        mso = self._mso_common()
+        if mso is not None:
+            return mso.chunk_gated_delta_rule_bwd_dhu_npu(*args, **kwargs)
         from fla.ops.common.backends.triton_ascend.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu_npu
         return chunk_gated_delta_rule_bwd_dhu_npu(*args, **kwargs)
 

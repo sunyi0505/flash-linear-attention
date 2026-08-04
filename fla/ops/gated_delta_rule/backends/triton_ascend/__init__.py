@@ -68,6 +68,13 @@ class TritonAscendGDNBackend(BaseBackend):
             return True, None
         return False, "unsupported dtype for NPU recompute_w_u_fwd"
 
+    def _mso_gdn(self):
+        from fla.ops.backends.triton_ascend_variant import use_mindspeed_ops
+        if use_mindspeed_ops():
+            import fla.ops.gated_delta_rule.backends.triton_ascend.mindspeed_ops as mso
+            return mso
+        return None
+
     def recompute_w_u_fwd(
         self,
         k,
@@ -78,6 +85,9 @@ class TritonAscendGDNBackend(BaseBackend):
         cu_seqlens=None,
         chunk_indices=None,
     ):
+        mso = self._mso_gdn()
+        if mso is not None:
+            return mso.recompute_w_u_fwd_npu(k, v, beta, A, g, cu_seqlens, chunk_indices)
         from fla.ops.gated_delta_rule.backends.triton_ascend.wy_fast import recompute_w_u_fwd_npu
         return recompute_w_u_fwd_npu(k, v, beta, A, g, cu_seqlens, chunk_indices)
 
@@ -85,6 +95,9 @@ class TritonAscendGDNBackend(BaseBackend):
         return True, None
 
     def prepare_wy_repr_bwd(self, *args, **kwargs):
+        mso = self._mso_gdn()
+        if mso is not None:
+            return mso.prepare_wy_repr_bwd_npu(*args, **kwargs)
         from fla.ops.gated_delta_rule.backends.triton_ascend.wy_fast import prepare_wy_repr_bwd_npu
         return prepare_wy_repr_bwd_npu(*args, **kwargs)
 

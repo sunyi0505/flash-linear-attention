@@ -33,7 +33,17 @@ class TritonAscendUtilsBackend(BaseBackend):
     def chunk_global_cumsum_verifier(self, *args, **kwargs):
         return True, None
 
+    def _mso_utils(self):
+        from fla.ops.backends.triton_ascend_variant import use_mindspeed_ops
+        if use_mindspeed_ops():
+            import fla.ops.utils.backends.triton_ascend.mindspeed_ops as mso
+            return mso
+        return None
+
     def chunk_global_cumsum(self, *args, **kwargs):
+        mso = self._mso_utils()
+        if mso is not None:
+            return mso.chunk_global_cumsum_npu(*args, **kwargs)
         from fla.ops.utils.backends.triton_ascend.cumsum import chunk_global_cumsum_npu
         return chunk_global_cumsum_npu(*args, **kwargs)
 
@@ -41,5 +51,8 @@ class TritonAscendUtilsBackend(BaseBackend):
         return True, None
 
     def chunk_local_cumsum(self, *args, **kwargs):
+        mso = self._mso_utils()
+        if mso is not None:
+            return mso.chunk_local_cumsum_npu(*args, **kwargs)
         from fla.ops.utils.backends.triton_ascend.cumsum import chunk_local_cumsum_npu
         return chunk_local_cumsum_npu(*args, **kwargs)

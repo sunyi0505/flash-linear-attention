@@ -209,12 +209,22 @@ class TritonAscendBackend(BaseBackend):
         from fla.modules.backends.triton_ascend.fused_kl_div import fused_kl_div_backward_npu
         return fused_kl_div_backward_npu(do, dx, dw)
 
+    def _mso_modules(self):
+        from fla.ops.backends.triton_ascend_variant import use_mindspeed_ops
+        if use_mindspeed_ops():
+            import fla.modules.backends.triton_ascend.mindspeed_ops as mso
+            return mso
+        return None
+
     def l2norm_fwd(
         self,
         x,
         eps=1e-6,
         output_dtype=None,
     ):
+        mso = self._mso_modules()
+        if mso is not None:
+            return mso.l2norm_fwd_npu(x, eps, output_dtype)
         from fla.modules.backends.triton_ascend.l2norm import l2norm_fwd_npu
         return l2norm_fwd_npu(x, eps, output_dtype)
 
@@ -225,6 +235,9 @@ class TritonAscendBackend(BaseBackend):
         dy,
         eps=1e-6,
     ):
+        mso = self._mso_modules()
+        if mso is not None:
+            return mso.l2norm_bwd_npu(y, rstd, dy, eps)
         from fla.modules.backends.triton_ascend.l2norm import l2norm_bwd_npu
         return l2norm_bwd_npu(y, rstd, dy)
 
