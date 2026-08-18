@@ -674,8 +674,7 @@ def chunk_kda_fwd_intra_npu(
 # drops from 6 pair-blocks to 1; Cube tiles are 32×32 instead of 16×16.
 # SAFE_GATE diag keeps many concurrent BC×BK fp32 tiles live. mem_mult=9 lets
 # host pick BK=128 (NK 4→2 on D256) while dq_db (past+diag) still fits 192KB UB.
-# dk_dg has a smaller live set and can use BK=256 (NK=1). dkt_future compiles at
-# BK=256 but faults at runtime (UB address OOB), so it stays on BK=128.
+# dk_dg / sequential dkt_future have a smaller live set and can use BK=256 (NK=1).
 _BWD_INTRA_BC = 32
 _BWD_INTRA_DQ_MEM_MULT = 9.0
 _BWD_INTRA_DK_MEM_MULT = 4.5
@@ -704,7 +703,7 @@ def _get_bwd_intra_bk(K: int, BC: int = _BWD_INTRA_BC, *, element_size: int = 2)
 
 
 def _get_bwd_intra_bk_dk(K: int, BC: int = _BWD_INTRA_BC, *, element_size: int = 2) -> int:
-    """Wider K tile for dk_dg (no past-subchunk live set). dkt_future cannot use this."""
+    """Wider K tile for dk_dg / sequential dkt_future (no past-subchunk live set)."""
     max_bk = _MAX_BK_DK if element_size <= 2 else min(_MAX_BK_DK, 32)
     return compute_row_tile_block_size(
         BC,
@@ -947,27 +946,27 @@ def chunk_kda_bwd_kernel_intra_dkt_future_npu(
                 p_gn = g_base + (min(i_ti + BC, T_cur) - 1).to(tl.int64) * g_row_stride + o_k
                 b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)[None, :]
                 for i_j in range(i_i + 1, nc_eff):
-                    p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
-                    p_kj = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+                    # Sequential q-then-k dots: parallel q/k/dA tiles overflow 192KB UB at BK=256.
+                    o_j = i_t * BT + i_j * BC + o_i
+                    m_j = o_j < T_cur
                     p_gk = _bwd_intra_g_block_ptr(g_base, T_cur, i_t * BT + i_j * BC, i_k * BK, BC, BK, g_row_stride, K)
-                    p_bj = tl.make_block_ptr(beta_base, (T_cur,), (beta_row_stride,), (i_t * BT + i_j * BC,), (BC,), (0,))
+                    b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
+                    b_gkn = exp2(b_gk - b_gn)
+                    b_gkn = tl.where(m_j[:, None], b_gkn, 0)
+                    p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
                     p_dAqk = tl.make_block_ptr(dAqk_ptr, (T_cur, BT), (HV * BT, 1),
                                                (i_t * BT + i_j * BC, i_i * BC), (BC, BC), (1, 0))
+                    b_qg = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32) * b_gkn
+                    b_dA = tl.trans(tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32))
+                    b_dkt += tl.dot(b_dA, b_qg, allow_tf32=False)
+                    p_kj = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_t * BT + i_j * BC, i_k * BK), (BC, BK), (1, 0))
+                    p_bj = tl.make_block_ptr(beta_base, (T_cur,), (beta_row_stride,), (i_t * BT + i_j * BC,), (BC,), (0,))
                     p_dAkk = tl.make_block_ptr(dAkk_ptr, (T_cur, BT), (HV * BT, 1),
                                                (i_t * BT + i_j * BC, i_i * BC), (BC, BC), (1, 0))
                     b_bj = tl.load(p_bj, boundary_check=(0,))
-                    b_qj = tl.load(p_q, boundary_check=(0, 1))
-                    b_kj = tl.load(p_kj, boundary_check=(0, 1))
-                    b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
-                    b_dAqk = tl.trans(tl.load(p_dAqk, boundary_check=(0, 1)).to(tl.float32))
-                    b_dAkk = tl.trans(tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32))
-                    o_j = i_t * BT + i_j * BC + o_i
-                    m_j = o_j < T_cur
-                    b_gkn = exp2(b_gk - b_gn)
-                    b_qg = b_qj * tl.where(m_j[:, None], b_gkn, 0)
-                    b_kbg = b_kj * b_bj[:, None] * tl.where(m_j[:, None], b_gkn, 0)
-                    b_dkt += tl.dot(b_dAqk, b_qg.to(tl.float32), allow_tf32=False)
-                    b_dkt += tl.dot(b_dAkk, b_kbg.to(tl.float32), allow_tf32=False)
+                    b_kbg = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32) * b_bj[:, None] * b_gkn
+                    b_dA = tl.trans(tl.load(p_dAkk, boundary_check=(0, 1)).to(tl.float32))
+                    b_dkt += tl.dot(b_dA, b_kbg, allow_tf32=False)
                 b_dkt *= exp2(b_gn - b_g)
             p_dkt_part = tl.make_block_ptr(dkt_part_ptr, (T_cur, K), (HV * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0))
             tl.store(p_dkt_part, b_dkt.to(p_dkt_part.dtype.element_ty), boundary_check=(0, 1))
@@ -1098,16 +1097,19 @@ def chunk_kda_bwd_intra_npu(
     B, T, H, K, HV = *k.shape, g.shape[2]
     BT = chunk_size
     BC = min(_BWD_INTRA_BC, BT)
-    # dq_db writes past+diag into fp32 dk2/dg2; tile for fp32 I/O even if dq is bf16.
-    elem = max(dq.element_size(), 4)
+    # Tile from the input dtype. mem_mult already models fp32 dk2/dg2 live tiles;
+    # forcing element_size=4 caps BK at 32 (NK 2→8 on D256).
+    elem = dq.element_size()
     BK = _get_bwd_intra_bk(K, BC, element_size=elem)
     BK_dk = _get_bwd_intra_bk_dk(K, BC, element_size=elem)
+    BK_fut = BK_dk
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
+    NK_fut = triton.cdiv(K, BK_fut)
     NK_dk = triton.cdiv(K, BK_dk)
     is_varlen = cu_seqlens is not None
     g_arg, g_t_contig = _gk_npu_arg(g, HV)
@@ -1125,7 +1127,7 @@ def chunk_kda_bwd_intra_npu(
     bh_total = B * HV
     task_num = NK * NC * NT * bh_total
     nc_fut = max(NC - 1, 1)
-    task_num_fut = NK * nc_fut * NT * bh_total
+    task_num_fut = NK_fut * nc_fut * NT * bh_total
     task_num_dk = NK_dk * NC * NT * bh_total
     common_launch = dict(
         cu_seqlens=cu_seqlens,
@@ -1178,7 +1180,7 @@ def chunk_kda_bwd_intra_npu(
                 dAkk=dAkk,
                 dkt_part=dkt_part,
                 NC_FUT=nc_fut,
-                **common_launch,
+                **{**common_launch, 'BK': BK_fut},
             ),
         )
     _launch_bwd_intra_core_grid(
