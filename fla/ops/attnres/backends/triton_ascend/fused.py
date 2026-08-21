@@ -12,11 +12,19 @@ cannot bind tuple arguments, so sources are stacked in L-chunks as
 ``[L_chunk, N, D]`` (capped at 512 MiB per chunk) instead of one ``[L, N, D]``
 buffer. Cross-chunk softmax stats are merged on the host; the weighted sum
 accumulates in a single fp32 ``o_mix`` buffer to match GPU register precision.
+
+``fwd_p2`` / ``bwd_dv`` use 1D ``[BD]`` tiles. A 2D ``[BL, BD]`` gather on
+those paths compiles to scalar on Triton-Ascend (``aiv_vec_ratio≈0``).
+``fwd_p2`` is D-outer / L-inner so ``o_mix`` stays in UB across L.
+``bwd_dv`` uses D-outer / L-inner only when ``BD >= D`` (``SINGLE_D``):
+``do`` / ``qw`` / ``dqw`` stay in UB and ``v`` is read once. A two-pass
+``ds`` scratch for ``BD < D`` was slower than L-outer (D=4096 fwdbwd
+14.13 → 14.51 ms); that path stays L-outer.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 
 import torch
 import triton
@@ -90,7 +98,7 @@ def _get_bd(row_dim: int, col_dim: int, *, memory_multiplier: float) -> int:
         dtype_size=4,
         fallback=_FALLBACK_BD,
         min_block=64,
-        max_block=2048,
+        max_block=8192,
     )
 
 
@@ -174,32 +182,34 @@ def attnres_fwd_p2_chunk_kernel(
     D,
     stride_ln,
     scale,
-    BL: tl.constexpr,
     BD: tl.constexpr,
     L_OFFSET,
     N_OFFSET: tl.constexpr,
-    ACCUM: tl.constexpr,
+    LOAD_OMIX: tl.constexpr,
 ):
+    # 1D [BD] tiles: 2D [BL, BD] gather compiles to scalar on Triton-Ascend.
+    # D-outer keeps b_o in UB so o_mix is written once per D-tile; LOAD_OMIX=0
+    # skips the opening GM load when the accumulator is known zeros.
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
     b_lse = tl.load(lse + i_n).to(tl.float32)
     for i_d in range(tl.cdiv(D, BD)):
         o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
         m_d = o_d < D
-        b_o = tl.zeros([BD], dtype=tl.float32)
-        for i_l in range(tl.cdiv(L, BL)):
-            o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
-            m_l = o_l < L
-            g_l = L_OFFSET + o_l
-            b_logit = tl.load(logit + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
-            b_p = tl.where(m_l, exp(b_logit * scale - b_lse), 0.0)
+        if LOAD_OMIX:
+            b_o = tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+        else:
+            b_o = tl.zeros([BD], dtype=tl.float32)
+        for i_l in range(L):
+            i_l64 = tl.cast(i_l, tl.int64)
+            g_l = L_OFFSET + i_l64
+            b_logit = tl.load(logit + g_l * N + i_n).to(tl.float32)
+            b_p = exp(b_logit * scale - b_lse)
             b_v = tl.load(
-                res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                mask=m_l[:, None] & m_d[None, :],
+                res + i_l64 * stride_ln + i_n * D + o_d,
+                mask=m_d,
                 other=0.0,
             ).to(tl.float32)
-            b_o += tl.sum(b_p[:, None] * b_v, axis=0)
-        if ACCUM:
-            b_o += tl.load(o_mix + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+            b_o += b_p * b_v
         tl.store(o_mix + i_n * D + o_d, b_o, mask=m_d)
 
 
@@ -297,90 +307,95 @@ def attnres_bwd_dv_chunk_kernel(
     D,
     stride_ln,
     scale,
-    BL: tl.constexpr,
     BD: tl.constexpr,
+    SINGLE_D: tl.constexpr,
+    LOAD_DQW: tl.constexpr,
     L_OFFSET,
     N_OFFSET: tl.constexpr,
 ):
+    # 1D [BD] tiles: 2D [BL, BD] gathers compile to scalar on Triton-Ascend
+    # (PipeUtilization: aiv_scalar_ratio≈0.997, aiv_vec_ratio≈0.004).
+    # SINGLE_D (BD>=D): D-outer, v loaded once. Else L-outer (two-pass ds
+    # scratch regresses D=4096).
     i_n = tl.program_id(0).to(tl.int64) + N_OFFSET
     b_lse = tl.load(lse + i_n).to(tl.float32)
-    b_delta = tl.load(b_delta + i_n).to(tl.float32)
-    for i_l in range(tl.cdiv(L, BL)):
-        o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
-        m_l = o_l < L
-        g_l = L_OFFSET + o_l
-        b_rstd = tl.load(rstd + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
-        b_logit = tl.load(logit + g_l * N + i_n, mask=m_l, other=0.).to(tl.float32)
-        b_p = tl.where(m_l, exp(b_logit * scale - b_lse), 0.0)
-        b_dp = tl.zeros([BL], dtype=tl.float32)
-        for i_d in range(tl.cdiv(D, BD)):
-            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-            m_d = o_d < D
-            b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-            b_v = tl.load(
-                res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                mask=m_l[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            b_dp += tl.sum(b_v * b_do[None, :], axis=1)
-        b_ds = b_p * (b_dp - b_delta) * scale
-        for i_d in range(tl.cdiv(D, BD)):
-            o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-            m_d = o_d < D
-            m_v = m_l[:, None] & m_d[None, :]
-            b_qw = (
-                tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
-                * tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
-            )
-            b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-            b_v = tl.load(
-                res + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                mask=m_v,
-                other=0.0,
-            ).to(tl.float32)
-            b_k = b_v * b_rstd[:, None]
-            b_dv = b_p[:, None] * b_do[None, :] + (b_ds * b_rstd)[:, None] * (
-                b_qw[None, :] - b_k * (b_logit / D)[:, None]
-            )
-            tl.store(
-                dres + o_l[:, None] * stride_ln + i_n * D + o_d[None, :],
-                b_dv.to(dres.dtype.element_ty),
-                mask=m_v,
-            )
+    b_delta_n = tl.load(b_delta + i_n).to(tl.float32)
+    if SINGLE_D:
+        o_d = tl.arange(0, BD).to(tl.int64)
+        m_d = o_d < D
+        b_qw = (
+            tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
+            * tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
+        )
+        b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+        if LOAD_DQW:
             b_dqw = tl.load(dqw + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-            b_dqw += tl.sum(b_ds[:, None] * b_k, axis=0)
-            tl.store(dqw + i_n * D + o_d, b_dqw, mask=m_d)
-
-
-@triton.jit(do_not_specialize=['N', 'D'])
-def attnres_bwd_kernel_dqdw_npu(
-    q,
-    w,
-    dqw,
-    dow_partial,
-    dq,
-    dw,
-    dow,
-    N,
-    D,
-    BD: tl.constexpr,
-    HAS_ONORM: tl.constexpr,
-):
-    i_d = tl.program_id(0)
-    o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
-    m_d = o_d < D
-    b_dqw = tl.zeros([BD], dtype=tl.float32)
-    b_dow = tl.zeros([BD], dtype=tl.float32)
-    for i_n in range(N):
-        b_dqw += tl.load(dqw + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-        if HAS_ONORM:
-            b_dow += tl.load(dow_partial + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
-    b_q = tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
-    b_w = tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
-    tl.store(dq + o_d, b_dqw * b_w, mask=m_d)
-    tl.store(dw + o_d, b_dqw * b_q, mask=m_d)
-    if HAS_ONORM:
-        tl.store(dow + o_d, b_dow, mask=m_d)
+        else:
+            b_dqw = tl.zeros([BD], dtype=tl.float32)
+        for i_l in range(L):
+            i_l64 = tl.cast(i_l, tl.int64)
+            g_l = L_OFFSET + i_l64
+            b_rstd = tl.load(rstd + g_l * N + i_n).to(tl.float32)
+            b_logit = tl.load(logit + g_l * N + i_n).to(tl.float32)
+            b_p = exp(b_logit * scale - b_lse)
+            b_v = tl.load(
+                res + i_l64 * stride_ln + i_n * D + o_d,
+                mask=m_d,
+                other=0.0,
+            ).to(tl.float32)
+            b_dp = tl.sum(tl.where(m_d, b_v * b_do, 0.0), axis=0)
+            b_ds = b_p * (b_dp - b_delta_n) * scale
+            b_k = b_v * b_rstd
+            b_dv = b_p * b_do + (b_ds * b_rstd) * (b_qw - b_k * (b_logit / D))
+            tl.store(
+                dres + i_l64 * stride_ln + i_n * D + o_d,
+                b_dv.to(dres.dtype.element_ty),
+                mask=m_d,
+            )
+            b_dqw += b_ds * b_k
+        tl.store(dqw + i_n * D + o_d, b_dqw, mask=m_d)
+    else:
+        for i_l in range(L):
+            i_l64 = tl.cast(i_l, tl.int64)
+            g_l = L_OFFSET + i_l64
+            b_rstd = tl.load(rstd + g_l * N + i_n).to(tl.float32)
+            b_logit = tl.load(logit + g_l * N + i_n).to(tl.float32)
+            b_p = exp(b_logit * scale - b_lse)
+            b_dp = tl.zeros([], dtype=tl.float32)
+            for i_d in range(tl.cdiv(D, BD)):
+                o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+                m_d = o_d < D
+                b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+                b_v = tl.load(
+                    res + i_l64 * stride_ln + i_n * D + o_d,
+                    mask=m_d,
+                    other=0.0,
+                ).to(tl.float32)
+                b_dp += tl.sum(tl.where(m_d, b_v * b_do, 0.0), axis=0)
+            b_ds = b_p * (b_dp - b_delta_n) * scale
+            for i_d in range(tl.cdiv(D, BD)):
+                o_d = (i_d * BD + tl.arange(0, BD)).to(tl.int64)
+                m_d = o_d < D
+                b_qw = (
+                    tl.load(q + o_d, mask=m_d, other=0.).to(tl.float32)
+                    * tl.load(w + o_d, mask=m_d, other=0.).to(tl.float32)
+                )
+                b_do = tl.load(do_eff + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+                b_v = tl.load(
+                    res + i_l64 * stride_ln + i_n * D + o_d,
+                    mask=m_d,
+                    other=0.0,
+                ).to(tl.float32)
+                b_k = b_v * b_rstd
+                b_dv = b_p * b_do + (b_ds * b_rstd) * (b_qw - b_k * (b_logit / D))
+                tl.store(
+                    dres + i_l64 * stride_ln + i_n * D + o_d,
+                    b_dv.to(dres.dtype.element_ty),
+                    mask=m_d,
+                )
+                b_dqw = tl.load(dqw + i_n * D + o_d, mask=m_d, other=0.).to(tl.float32)
+                b_dqw += b_ds * b_k
+                tl.store(dqw + i_n * D + o_d, b_dqw, mask=m_d)
 
 
 def _get_o_mix(
@@ -391,14 +406,16 @@ def _get_o_mix(
     device: torch.device,
     o_pre: torch.Tensor | None = None,
     o_mix: torch.Tensor | None = None,
+    chunks: Iterable[tuple[int, int, torch.Tensor, int, int, int]] | None = None,
 ) -> torch.Tensor:
     if o_pre is not None:
         return o_pre
     if o_mix is None:
         o_mix = torch.zeros(*sources[0].shape, device=device, dtype=torch.float32)
-    first = True
-    for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
-        bl, bd = _get_bl_bd(ll, D, mem_mult=_FWD_MEM_MULT)
+    load_omix = 0
+    stream = chunks if chunks is not None else _iter_l_chunks(sources)
+    for l0, ll, chunk, stride_ln, N, D in stream:
+        bd = _get_bd(1, D, memory_multiplier=_FWD_MEM_MULT)
         _launch_n(
             attnres_fwd_p2_chunk_kernel,
             N,
@@ -411,12 +428,11 @@ def _get_o_mix(
             D=D,
             stride_ln=stride_ln,
             scale=scale,
-            BL=bl,
             BD=bd,
             L_OFFSET=l0,
-            ACCUM=not first,
+            LOAD_OMIX=load_omix,
         )
-        first = False
+        load_omix = 1
         del chunk
     return o_mix
 
@@ -456,6 +472,8 @@ def fused_attnres_fwd_npu(
 
     m = torch.full((N,), float('-inf'), device=sources[0].device, dtype=torch.float32)
     acc = torch.zeros(N, device=sources[0].device, dtype=torch.float32)
+    reuse_chunks = _l_chunk_size(L, N, D, sources[0].element_size()) >= L
+    held: list[tuple[int, int, torch.Tensor, int, int, int]] = []
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
         chunk_m = torch.empty(N, device=chunk.device, dtype=torch.float32)
         chunk_acc = torch.empty(N, device=chunk.device, dtype=torch.float32)
@@ -481,10 +499,17 @@ def fused_attnres_fwd_npu(
             L_OFFSET=l0,
         )
         m, acc = _merge_online_softmax(m, acc, chunk_m, chunk_acc)
-        del chunk, chunk_m, chunk_acc
+        del chunk_m, chunk_acc
+        if reuse_chunks:
+            held.append((l0, ll, chunk, stride_ln, N, D))
+        else:
+            del chunk
 
     lse.copy_(m + torch.log(acc))
-    o_mix = _get_o_mix(sources, logit, lse, scale, sources[0].device)
+    o_mix = _get_o_mix(
+        sources, logit, lse, scale, sources[0].device,
+        chunks=held if reuse_chunks else None,
+    )
 
     if save_opre:
         o_pre.copy_(o_mix.to(dtype))
@@ -504,6 +529,9 @@ def fused_attnres_fwd_npu(
             eps=eps,
             BD=_get_bd(1, D, memory_multiplier=2.0),
         )
+    # ckpt=1 still keeps fp32 o_mix so bwd skips the p2 restack (~0.7 ms + Pack).
+    if o_pre is None:
+        o_pre = o_mix
     return o, o_pre, rstd, logit, lse
 
 
@@ -550,9 +578,11 @@ def fused_attnres_bwd_npu(
         HAS_ONORM=has_onorm,
     )
 
+    load_dqw = 0
     for l0, ll, chunk, stride_ln, N, D in _iter_l_chunks(sources):
         dres = _dres_chunk(flat_dvs, sources, l0, ll, chunk)
-        bl, bd = _get_bl_bd(ll, D, mem_mult=_BWD_DV_MEM_MULT)
+        bd = _get_bd(1, D, memory_multiplier=_BWD_DV_MEM_MULT)
+        single_d = 1 if bd >= D else 0
         _launch_n(
             attnres_bwd_dv_chunk_kernel,
             N,
@@ -571,10 +601,12 @@ def fused_attnres_bwd_npu(
             D=D,
             stride_ln=stride_ln,
             scale=scale,
-            BL=bl,
             BD=bd,
+            SINGLE_D=single_d,
+            LOAD_DQW=load_dqw,
             L_OFFSET=l0,
         )
+        load_dqw = 1
         if ll > 1:
             for i in range(ll):
                 idx = l0 + i
@@ -584,20 +616,11 @@ def fused_attnres_bwd_npu(
             del dres
         del chunk
 
-    bd = _get_bd(1, D, memory_multiplier=2.0)
-    attnres_bwd_kernel_dqdw_npu[(triton.cdiv(D, bd),)](
-        q=q,
-        w=w,
-        dqw=dqw,
-        dow_partial=dow_partial,
-        dq=dq,
-        dw=dw,
-        dow=dow if dow is not None else dq,
-        N=N,
-        D=D,
-        BD=bd,
-        HAS_ONORM=has_onorm,
-    )
+    dqw_sum = dqw.sum(dim=0)
+    dq.copy_((dqw_sum * w.float()).to(dq.dtype))
+    dw.copy_((dqw_sum * q.float()).to(dw.dtype))
+    if has_onorm:
+        dow.copy_(dow_partial.sum(dim=0).to(dow.dtype))
     assert all(t is not None for t in flat_dvs)
     return dq, dw, dow, flat_dvs  # type: ignore[return-value]
 
