@@ -6,11 +6,13 @@ description: >
   bottleneck diagnosis, and kernel optimization (UB tiling, grid splits, fusion/split, varlen,
   G_T_CONTIG gate loading, constexpr DMA-path split / TAIL_MODE, extract_slice, MTE OOB,
   int32 address overflow, tl.cast vs constexpr .to, make_block_ptr int32 offsets,
-  correctness gates, tl.dot left-operand clobber). NPU kernels must not use num_warps/num_stages.
+  correctness gates, tl.dot left-operand clobber, fp32-before-Cube downcast).
+  NPU kernels must not use num_warps/num_stages.
   Per-kernel catalog: references/cases.md (incl. causal_conv1d core-grid).
   Use when working on NPU profiling, kernel_details/op_statistic, aic_metrics,
   fla triton_ascend backends (ops or modules), g transpose stride-1, UB overflow,
-  dual-path DCE, grid limits, int64 pointer math, tl.dot reuse, or Ascend performance.
+  dual-path DCE, grid limits, int64 pointer math, tl.dot reuse, bf16 MMA
+  precision, or Ascend performance.
 ---
 
 # FLA Ascend NPU: Profiling → Bottlenecks → Optimization
@@ -145,8 +147,9 @@ Change only levers that match the bottleneck; one hypothesis per round. Before t
 - **`make_block_ptr` offsets stay int32**: Triton rejects int64 `offsets/block_shape`. Flattened pointer math (`bos * D`, `t0 * D`, `i_b * stride`) uses int64; pass `i_t * BT` (int32) as the block row offset. Do not feed `t0` into `make_block_ptr`. Case: [causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
 - **Varlen `cu_seqlens` → int64 for pointer math**: host dtype is often `torch.long`, but tests also pass `int32`; load as `tl.int64` either way. Loading `.to(tl.int32)` then `(bos * HV + i_hv) * V` overflows well before `bos` hits 2³¹ (HV=32, V=4096 → safe `bos` ≈ 16K). Pattern: `bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64); T_cur = (eos - bos).to(tl.int32)`. Non-varlen: `bos = tl.cast(i_b, tl.int64) * T` (CUDA/repo often writes `(i_b * T).to(tl.int64)`, which still wraps if `i_b * T` exceeds 2³¹). Alternative when `T_cur` only needs int32: load `bos` as int32 but cast **the index** before the large stride — `tl.cast(bos, tl.int64) * HV + i_h` then `* K`. `(bos * HV + i_h).to(tl.int64) * K` only fixes `* K`/`* V` (HV is small); `bos * HV` itself can still wrap.
 - Reductions / recurrence / grads use fp32 accum, cast on store; sensitive solves: `input_precision='ieee'` / `allow_tf32=False`; mask before exp on gated paths; keep a consistent `exp`/`exp2` base.
+- **Do not downcast a grown fp32 tile before Cube MMA**: `tl.dot(b_A.to(b_v.dtype), b_v)` (and `dh`/`ds`/WY `A`) is a silent bf16 quantization of an already-large fp32 accumulator. Keep that MMA in fp32 (`tl.dot(b_A, b_v.to(tl.float32))`); cast on store. Do **not** promote two already-bf16 checkpoints (`h`/`do`/`v`/stored `dv`) — `tl.dot` same-dtype would just turn a Cube-bf16 MMA into a slower fp32 one with no extra bits. Diagnose: kernel output matches a Torch `A.to(bf16) @ v` sim, not the fp32 oracle. Catalog: [cases.md § fp32-before-Cube](references/cases.md#fp32-accumulator-downcast-before-cube-mma). Trap: [TRAPS.md](references/TRAPS.md).
 - **Ascend `tl.dot` clobbers the left operand**: on NPU, `tl.dot(lhs, rhs, …)` may overwrite `lhs` in UB (CUDA Triton does not). Any later read of that tile (second lhs, rhs, store) sees corrupted data unless you reload from GM or copy with `tile + 0.0` **before** the first lhs dot. Full per-kernel catalog: [cases.md § tl.dot lhs clobber](references/cases.md#tldot-lhs-clobber--repo-wide-case-catalog). Symptom: silent numeric drift vs Torch oracle with no compile error.
-- **Audit checklist for new/changed kernels**: (1) `rg 'tl\.dot\(' fla/ops/**/triton_ascend/**` — only 8 op files use `tl.dot`; (2) for each lhs tile, flag lhs→lhs, lhs→rhs/store, or post-dot copy; (3) prefer GM reload for one reuse between stages, `+ 0.0` for tight multi-dot sequences; (4) re-run `tests/ops/test_gdn_kernels.py` + op-specific kernel tests.
+- **Audit checklist for new/changed kernels**: (1) `rg 'tl\.dot\(' fla/ops/**/triton_ascend/**` — only 8 op files use `tl.dot`; (2) for each lhs tile, flag lhs→lhs, lhs→rhs/store, or post-dot copy; (3) prefer GM reload for one reuse between stages, `+ 0.0` for tight multi-dot sequences; (4) flag `.to(b_*.dtype)` / `.to(k.dtype)` on an fp32 accum immediately before `tl.dot`; (5) re-run `tests/ops/test_gdn_kernels.py` + op-specific kernel tests.
 - **Upstream**: lhs clobber is a Triton-Ascend backend limitation (UB capacity / in-place matmul), not intentional API. Durable fix belongs in the compiler (preserve lhs or emit a diagnostic on post-dot read). Track via the Triton-Ascend / Ascend backend issue tracker.
 - For separable gate differences, compute `exp2(gs)[:, None] / exp2(gc)[None, :]` instead of `exp2(gs[:, None] - gc[None, :])` to replace a matrix of exponentials with two vectors. Verify numerics on the target compiler; multiplying by `exp2(-gc)` can produce materially different Ascend results.
 - **Constexpr-split mutually exclusive DMA paths** (critical on Ascend): a runtime `if is_tail_chunk` that chooses `make_block_ptr` vs masked `tl.load` keeps **both** paths live in UB. Peak UB ≈ sum of both; Vector cannot saturate even when MemoryUB bandwidth is free; larger tiles then fail compile. Host-split the last tile into a second launch with `tl.constexpr TAIL_MODE` (`0` = never tail / block_ptr only, `1` = always masked, `2` = runtime for varlen / `NT==1`) so each compile DCE's the unused path. Case: [causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
@@ -204,6 +207,7 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - [ ] Optional-pointer constexpr flags are nested, not `or`-ed with runtime checks (None ptr must not compile)
 - [ ] Block pointers contiguous innermost; **gate `g` uses G_T_CONTIG** when `[B,T,HV]` (see [g-contiguous-loading.md](references/g-contiguous-loading.md)); tail `boundary_check`
 - [ ] fp32 accum consistent with output/exp base; fusion worth the complexity (no gratuitous `ACCUMULATE_OUTPUT` writeback when UB allows)
+- [ ] Grown fp32 tiles (`A`/`dh`/`ds`/WY inverse) stay fp32 through Cube MMA; cast on store — not `tl.dot(x.to(y.dtype), y)`. Checkpoint×checkpoint (`do@h`, `dv@h`, `do@v`) stays Cube bf16 ([cases.md § fp32-before-Cube](references/cases.md#fp32-accumulator-downcast-before-cube-mma))
 - [ ] Reused `tl.dot` left-hand tiles: GM reload or `tile + 0.0` **before** first lhs dot (post-dot copy invalid); see [cases.md § tl.dot catalog](references/cases.md#tldot-lhs-clobber--repo-wide-case-catalog)
 - [ ] fwd/bwd/varlen/layout branches covered; no unwritten regions under NaN poisoning
 - [ ] Runtime indices (`NT`, `i_t`, `i_b`, `B`, program IDs) via `tl.cast(..., tl.int64)` **before** stride / `BT` / `D` multiply — including packed `offset * D`. Not gated on `do_not_specialize`. Do not call `.to(tl.int64)` on specialized kernel args (`constexpr` has no `.to`)
@@ -227,6 +231,8 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - `if CONSTEXPR_FLAG or runtime:` around an optional pointer — else still compiles when the ptr is None
 - `B.to(tl.int64)` / `i_t.to(tl.int64)` on specialized or folded constexpr ints (`constexpr` has no `.to`); use `tl.cast`
 - Passing int64 `t0` as `make_block_ptr` offsets (`offsets/block_shape` must be int32)
+- `tl.dot(fp32_accum.to(bf16), rhs)` — Cube sees a quantized score/state; abs looks like 0.125 / 1 ULP of a large magnitude, ratio may still pass
+- Promoting bf16 checkpoints to fp32 before `tl.dot` “for precision” — bits were lost at store; Cube-bf16 is the fast path (e.g. `dqkwg` `do@h` / `dv@h` / `do@v`)
 
 ## Related files
 
@@ -235,5 +241,5 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - Past kernel case notes: [references/cases.md](references/cases.md)
 - **Gate `g` stride-1 loading (G_T_CONTIG)**: [g-contiguous-loading.md](references/g-contiguous-loading.md)
 - **causal_conv1d 1D core-grid + constexpr DMA split**: [cases.md § causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split)
-- Ascend-specific traps (DMA dual-path UB, None-ptr compile, `constexpr` `.to`, int64 `block_ptr` offsets): [TRAPS.md](references/TRAPS.md)
+- Ascend-specific traps (DMA dual-path UB, None-ptr compile, `constexpr` `.to`, int64 `block_ptr` offsets, fp32-before-Cube downcast): [TRAPS.md](references/TRAPS.md)
 - Ad-hoc workload output dir: `npu_prof/` (new collection must use the generic scripts)

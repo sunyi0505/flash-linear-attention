@@ -33,3 +33,13 @@ Each entry: **Fact / Why / How to apply**.
 **Why:** Block-pointer metadata is int32 by design. Flattened `ptr + offset * stride` is the path that needs int64.
 
 **How to apply:** Keep `t0` (int64) for `x + bos * D + t0 * D`. Pass `i_t * BT` (int32) to `make_block_ptr`. See [cases.md § causal_conv1d](cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
+
+---
+
+## fp32 accumulator downcast before Cube MMA
+
+**Fact:** `tl.dot(b_A.to(b_v.dtype), b_v)` (same for `dh`/`ds`/WY inverse `A`) quantizes an already-grown **fp32** tile to bf16/fp16 immediately before Cube. The kernel then matches a Torch `A.to(bf16) @ v` simulation, not the fp32 oracle. Abs error is 1–few ULPs of `|A|` (e.g. `|A|≈40` → bf16 ULP 0.25 → `o` abs 0.125). Ratio can still pass a loose e2e gate.
+
+**Why:** CUDA Tensor Cores often run the same downcast; NPU Cube is harsher on that ULP, and FLA per-kernel tests compare against fp32 autograd. `|A|` without `scale` is O(K); a WY Jacobian is two 64×64 MMAs that amplify even `|A|≈1` (bf16 ULP ~1e-3). Loading an already-bf16 checkpoint (`h`/`dh` stored as `k.dtype`) and `.to(operand.dtype)` is **not** this bug — the bits were lost at store. `b_w.to(tl.float32)` then `h.to(b_w.dtype)` is a no-op.
+
+**How to apply:** Keep the MMA in fp32: `tl.dot(b_A, b_v.to(tl.float32))` (or both operands `.to(tl.float32)` if `A` may be bf16 on another caller). Cast on store. For WY inverse, keep `solve_tril(..., output_dtype=torch.float32)` so the Jacobian sees fp32 `A`. Do **not** lift two checkpoints already stored as `k.dtype` (`do@h`, `dv@h`, `do@v`) — that is not this bug and doubles MTE for no extra mantissa. Diagnose with a Torch sim of the last MMA at both dtypes before changing the kernel. Catalog: [cases.md § fp32-before-Cube](cases.md#fp32-accumulator-downcast-before-cube-mma).

@@ -44,11 +44,12 @@ def chunk_gated_delta_rule_fwd_intra_npu(
         chunk_size=BT,
         output_dtype=torch.float32,
     )
+    # fp32 inverse: Jacobian MMAs amplify bf16 A; fp32 store avoids load-cast in recompute_w_u_fwd.
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        output_dtype=k.dtype,
+        output_dtype=torch.float32,
     )
     w, u = recompute_w_u_fwd(
         k=k,

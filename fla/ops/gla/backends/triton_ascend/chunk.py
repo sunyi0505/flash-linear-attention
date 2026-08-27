@@ -409,7 +409,9 @@ def chunk_gla_fwd_kernel_o_npu(
         m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
         b_A = tl.where(m_s & (m_t[:, None] & m_t[None, :]), b_A, 0.0)
         b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+        # |A| is O(1)–O(K^0); keep it fp32. Downcasting to bf16 before Cube
+        # matches the GDN chunk_fwd_o bug (A.to(v.dtype) @ v).
+        b_o += tl.dot(b_A.to(tl.float32), b_v.to(tl.float32))
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 

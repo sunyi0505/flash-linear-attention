@@ -59,6 +59,7 @@ File: `fla/ops/common/backends/triton_ascend/chunk_delta_h.py`
 - **Tile selection is cost-model, not max-BK**: minimize `cdiv(V,BV)*(3+4*cdiv(K,BK))` under soft UB (`peak <= UB*1.15`, multi-slab dh live) on the **host-precomputed gate** path. Max oneslab `BK=min(256,pow2(K))` with BV capped at 64 loses on D256 to **BK=128/BV=128** (nv 4→2 beats extra K-slab ptrs). Shrinking BV only to grow BK (e.g. BV 64→32) remains a loss. Measured B8 T2048 H32 bf16: D256 ~15.5→11.4ms, D128 ~6.2→3.3ms; still AIC-scalar dominated (`aic_scalar_ratio`~0.66, `aic_mac_ratio`~0.07).
 - **Gate-inline UB (T%BT!=0 / varlen)**: in-kernel `exp2(g)` inflates compile UB ~1.7× vs analytical peak — `BK=128/BV=128` fails (`req 262400 > 196608`) on D128 unaligned even though host util≈0.75. Use `gate_inline` → soft cap `UB*0.60` (D128→`BK=128/BV=64`, D256→`BK=256/BV=32`); keep precomp tiles unchanged.
 - **`tl.dot` lhs clobber (bwd `dhu`)**: `b_do` reused as lhs across K-slabs; `b_dv` corrected in-place then subtracted. See [§ tl.dot catalog — chunk_delta_h](cases.md#chunk_delta_hpy).
+- **fp32-before-Cube (bwd `dhu`)**: in-register `dh.to(k.dtype)` before MMA; `STATE_V_FIRST` also put `dh` on clobberable lhs. Keep fp32 `k@dh` / `w@dv`; `q@do` stays Cube bf16 so the host tile model can keep BV=128 on D256. CUDA layout `k @ trans(dh)`. See [§ fp32-before-Cube](#fp32-accumulator-downcast-before-cube-mma).
 
 ## `chunk_o.py` — fwd fuse + bwd G_T_CONTIG
 
@@ -68,6 +69,7 @@ File: `fla/ops/common/backends/triton_ascend/chunk_o.py`
 - Bwd `G_T_CONTIG`: `chunk_bwd_dv_local_npu`, `chunk_bwd_dqkwg_npu`, `chunk_bwd_kernel_dg_npu` — stride-1 `g_ptr` (`i_b*HV*T+i_h*T` / varlen `bos+i_h*T`), `T_seq` before varlen.
 - dv_local kernel ~6.5→0.18ms, dqkwg ~10.8→0.91ms (B2 T2048 HV8). Fix `BV`, autotune `BK`. Details: [g-contiguous-loading.md](g-contiguous-loading.md).
 - **`tl.dot` lhs clobber**: fwd `b_q`/`b_q_c`; bwd `b_k0_c`, `b_ds_c`, `b_A_pristine`. See [§ tl.dot catalog](cases.md#chunk_opy).
+- **fp32-before-Cube**: last MMA was `A.to(v.dtype) @ v` (`|A|` O(K) ≈ 40). Keep `tl.dot(b_A, b_v.to(tl.float32))`. Same class: `dv_local` `A@do`, `dqkwg` grown `ds@k` / `ds.T@q`. Checkpoint×checkpoint (`do@h`, `dv@h`, `do@v`) stays Cube bf16. See [§ fp32-before-Cube](#fp32-accumulator-downcast-before-cube-mma).
 
 ## `chunk_bwd.py` — varlen `cu_seqlens` int32 overflow
 
@@ -203,3 +205,34 @@ File: `fla/ops/common/backends/triton_ascend/chunk_scaled_dot_kkt.py`
 ### Upstream
 
 lhs clobber is a Triton-Ascend backend limitation (UB capacity / in-place matmul), not intentional API. Durable fix: compiler preserves lhs or emits a diagnostic on post-dot read. Track via Triton-Ascend / Ascend backend issue tracker.
+
+---
+
+## fp32 accumulator downcast before Cube MMA
+
+**Rule:** an fp32 tile that has already grown (`q@k` scores, recurrent `h`/`dh`, `ds`, WY inverse `A`) must stay fp32 through `tl.dot`. Cast on store only. Two operands already stored as `k.dtype` stay Cube bf16 — promoting them does not recover bits and costs MTE/UB.
+
+**Diagnose:** kernel vs Torch `X.to(bf16) @ Y` is abs≈0, while kernel vs fp32 oracle shows abs = 1–few ULPs of `|X|`. `assert_close` ratio can still pass. Not this bug: loading a checkpoint already stored as `k.dtype`, or `.to(b_w.dtype)` when `b_w` is already fp32.
+
+**Fix:** `tl.dot(b_A, b_v.to(tl.float32))` (both `.to(tl.float32)` if one caller stores `A` as bf16). WY inverse: `solve_tril(..., output_dtype=torch.float32)`. Checkpoint×checkpoint stays Cube bf16. Trap: [TRAPS.md](TRAPS.md).
+
+**Audit (2026-08):** `rg '\.to\(b_.*\.dtype\)' fla/**/triton_ascend/**` next to `tl.dot`.
+
+| Kernel | Pattern | Status |
+|--------|---------|--------|
+| `chunk_fwd_kernel_o_npu` | in-register `A` (`q@k`, no scale) `.to(v.dtype)` before last MMA; `|A|≈40` → o abs 0.125 | **Fixed** — `tl.dot(b_A, b_v.to(tl.float32))`; leftover abs is 1 ULP of `o` |
+| `chunk_bwd_dv_local` / GVA `dv` | same `A.to(do.dtype) @ do` | **Fixed** — fp32 MMA |
+| `chunk_bwd_dqkwg_npu` | grown `ds.to(k.dtype)` before `ds@k` / `ds.T@q`; GVA sum in bf16 | **Fixed** — fp32 `ds` MMA; GVA reduce in fp32. `do@h` / `dv@h` / `do@v` stay Cube bf16 (checkpoints) |
+| `chunk_gated_delta_rule_bwd_dhu` | in-register `dh.to(k.dtype)` before MMA; `STATE_V_FIRST` also put `dh` on clobberable lhs | **Fixed** — fp32 `k@dh` / `w@dv`; `q@do` stays Cube bf16; `STATE_V_FIRST` is CUDA `k @ trans(dh)` |
+| GDN `prepare_wy_repr_bwd` / `solve_tril` | production `A` written as `k.dtype`; two 64×64 Jacobian MMAs amplify 1 ULP (`dk` abs 0.0625) | **Fixed** — `output_dtype=torch.float32`. `dk` buffer is fp32 only when `H!=HV` (GVA reduce) |
+| GDN `recompute_w_u_fwd` | `A` fp32 load, `kb` fp32 MMA | **OK** |
+| GLA `chunk_gla_fwd_kernel_o_npu` | `A` stored fp32 then `A.to(v.dtype) @ v` (`|A|≈3–4` with scale folded) | **Fixed** — `tl.dot(b_A.to(tl.float32), b_v.to(tl.float32))` (KDA shares this kernel with bf16 `Aqk`) |
+| GLA bwd `dv` / `dqkg` | already `A`/`h`/`dh` `.to(tl.float32)` before MMA | **OK** |
+| `chunk_delta_h` fwd `w @ h` | `b_w = load.to(tl.float32)` then `h.to(b_w.dtype)` | **OK** — no-op fp32→fp32 |
+| `chunk_h` / `fused_recurrent` / `solve_tril` / `chunk_scaled_dot_kkt` | fp32 accum, ieee solve, fp32 `A` store | **OK** |
+| KDA `Aqk` store as `k.dtype` | fp32 `q@k` written bf16; `|Aqk|max≈0.05` after L2norm+scale | **OK** at that magnitude; not in-register downcast |
+| KDA `Akk` (WY inverse) as `k.dtype` + `dA.to(A.dtype) @ A` twice | same class as pre-fix GDN `A`; Jacobian abs ~0.013 vs GDN's 0.0625 | **Residual** — matches CUDA KDA; promoting `Akk` to fp32 is a stored-precision contract change |
+| KDA bwd `h.to(do.dtype)` / `dh.to(v_new.dtype)` | load of bf16 checkpoints | **OK** — bits already lost at `h`/`dh` store |
+| GLA `qg.to(q.dtype)` before `q@h` | elementwise `q*exp2(g)*scale`, not a grown accum; `h` is a bf16 checkpoint | **OK** for this class |
+
+**Verification:** `tests/ops/test_gdn_kernels.py` (per-kernel abs/ratio), `tests/ops/test_gla.py`. Isolated Torch sim of the last MMA at both dtypes before claiming a fix.

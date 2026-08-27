@@ -721,7 +721,7 @@ def prepare_wy_repr_bwd_npu(
     use_g = g is not None
     is_varlen = cu_seqlens is not None
 
-    dk = k.new_empty(B, T, HV, K)
+    dk = torch.empty(B, T, HV, K, dtype=torch.float32 if H != HV else k.dtype, device=k.device)
     dv = torch.empty_like(v)
     dg, dg_t_contig = None, False
     if use_g:
@@ -829,6 +829,7 @@ def prepare_wy_repr_bwd_npu(
         )
     if H != HV:
         dk = dk.view(B, T, H, HV // H, K).sum(3)
+    dk = dk.to(k.dtype)
     if db_t_contig:
         db = db.transpose(1, 2).contiguous()
     if use_g and dg_t_contig:
