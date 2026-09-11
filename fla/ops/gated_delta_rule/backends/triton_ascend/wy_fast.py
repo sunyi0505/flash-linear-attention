@@ -61,9 +61,10 @@ def _beta_npu_arg(beta: torch.Tensor, HV: int) -> tuple[torch.Tensor, bool]:
 def _t_npu_buf(
     B: int, T: int, HV: int, *, dtype: torch.dtype, device: torch.device,
 ) -> tuple[torch.Tensor, bool]:
+    # zeros: leftover-T boundary_check stores RMW dest lanes (pytest NaN-poisons empty).
     if HV == 1:
-        return torch.empty(B, T, HV, dtype=dtype, device=device), False
-    return torch.empty(B, HV, T, dtype=dtype, device=device), True
+        return torch.zeros(B, T, HV, dtype=dtype, device=device), False
+    return torch.zeros(B, HV, T, dtype=dtype, device=device), True
 
 
 def _bwd_col_tile(BT: int, dim: int, mem_mult: float, max_tile: int) -> int:
@@ -627,8 +628,10 @@ def recompute_w_u_fwd_npu(
             if best_cost is None or cost < best_cost or (cost == best_cost and bk + bv > BK + BV):
                 best_cost, BK, BV = cost, bk, bv
 
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, HV, K)
+    # zeros: Triton-Ascend boundary_check stores RMW leftover-T lanes, so
+    # NaN-poisoned empty buffers leak into valid tokens on partial chunks.
+    u = torch.zeros_like(v)
+    w = k.new_zeros(B, T, HV, K)
     beta, beta_t_contig = _beta_npu_arg(beta, HV)
     g, g_t_contig = _g_npu_arg(g, HV)
 
@@ -683,8 +686,8 @@ def prepare_wy_repr_bwd_npu(
     use_g = g is not None
     is_varlen = cu_seqlens is not None
 
-    dk = k.new_empty(B, T, HV, K)
-    dv = torch.empty_like(v)
+    dk = k.new_zeros(B, T, HV, K)
+    dv = torch.zeros_like(v)
     db, db_t_contig = _t_npu_buf(B, T, HV, dtype=beta.dtype, device=k.device)
     beta_arg, beta_t_contig = _beta_npu_arg(beta, HV)
     dg, dg_t_contig = None, False
@@ -699,9 +702,9 @@ def prepare_wy_repr_bwd_npu(
             g_k_arg = torch.exp2(g_gate.float()).to(g_gate.dtype)
             g_exp_precomp = True
     dg_arg = dg if use_g else beta
-    dA_scr = torch.empty_like(A, dtype=torch.float32)
-    dA_mid = torch.empty_like(A, dtype=torch.float32)
-    dA_out = torch.empty_like(A, dtype=torch.float32)
+    dA_scr = torch.zeros_like(A, dtype=torch.float32)
+    dA_mid = torch.zeros_like(A, dtype=torch.float32)
+    dA_out = torch.zeros_like(A, dtype=torch.float32)
 
     base = dict(
         cu_seqlens=cu_seqlens,

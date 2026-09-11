@@ -5,20 +5,10 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""
-Chunked ATK forward kernel for preconditioned delta rules.
-K-tiled variant: processes head dimension in BK blocks.
+"""Chunked ATK forward adapted for triton-ascend on Ascend NPU."""
 
-ATK recurrence:
-    A_t = exp(g) * A_{t-1} + beta * k^2
+from __future__ import annotations
 
-Preconditioner (symmetric fast squash):
-    ell = log(A_t + eps)
-    r = ell - log_atk_scale                # deviation from learned center
-    s = r / (1 + |r|)                      # fast squash, bounded in (-1, 1)
-    M = exp(-log(x) * s)                   # bounded multiplier in [1/x, x]
-    k_precond = k * M
-"""
 import math
 import os
 
@@ -26,21 +16,52 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.backends import dispatch
+from fla.utils.ascend_ub_manager import ASCEND_LAUNCH_BLOCK_BUDGET
+
+_NPU_CHUNK_LEN = 16
+
+
+def atk_forward_pass_chunks_torch(
+    a: torch.Tensor,
+    sa: torch.Tensor,
+    ac: torch.Tensor,
+    h0: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_len: int,
+):
+    """Prefix-scan ATK chunk summaries. ``tl.range`` over chunks is unreliable on NPU."""
+    n, n_chunks, h, d = a.shape
+    if cu_seqlens is None:
+        seq_chunks = [n_chunks] * n
+    else:
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        seq_chunks = [int(math.ceil(int(s) / chunk_len)) for s in seqlens]
+
+    for i in range(n):
+        nc = seq_chunks[i]
+        if nc <= 0:
+            continue
+        if h0 is None:
+            carry = torch.zeros(h, d, device=a.device, dtype=torch.float32)
+        else:
+            carry = h0[i].float()
+        for c in range(nc):
+            carry = torch.exp(sa[i, c, :, None]) * carry + a[i, c]
+            ac[i, c] = carry
 
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.jit(do_not_specialize=['T'])
-def _forward_chunk_summary(
-    k,                # *f32 [B, T, H, D]
-    beta,             # *f32 [B, T, H]
-    log_g,            # *f32 [B, T, H]
-    a,                # *f32 [B, C, H, D]
-    sa,               # *f32 [B, C, H]
-    cu_seqlens,       # *i32 [N+1] - cumulative sequence lengths (None if not varlen)
-    chunk_indices,    # *i32 [NT, 2] - (sequence_idx, chunk_idx) pairs (None if not varlen)
+@triton.jit(do_not_specialize=['T', 'chunk_offset'])
+def _forward_chunk_summary_npu(
+    k,
+    beta,
+    log_g,
+    a,
+    sa,
+    cu_seqlens,
+    chunk_indices,
     B: tl.constexpr,
     T,
     H: tl.constexpr,
@@ -53,10 +74,11 @@ def _forward_chunk_summary(
     sa_stride_b, sa_stride_c, sa_stride_h,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    chunk_offset,
 ):
     i_t = tl.program_id(0)
     h = tl.program_id(1)
-    chunk_id = tl.program_id(2).to(tl.int64)
+    chunk_id = tl.program_id(2).to(tl.int64) + chunk_offset
 
     if IS_VARLEN:
         i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
@@ -119,87 +141,17 @@ def _forward_chunk_summary(
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
-def _forward_pass_chunks(
-    a,            # *f32 [B, C, H, D]
-    sa,           # *f32 [B, C, H]
-    ac,           # *f32 [B, C, H, D]
-    h0,           # *f32 [N, H, D] or None
-    cu_seqlens,   # *i32 [N+1]
-    B: tl.constexpr,
-    T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    CHUNK_LEN: tl.constexpr,
-    a_stride_b, a_stride_c, a_stride_h, a_stride_d,
-    sa_stride_b, sa_stride_c, sa_stride_h,
-    ac_stride_b, ac_stride_c, ac_stride_h, ac_stride_d,
-    BK: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_nh = tl.program_id(0).to(tl.int64)
-
-    if IS_VARLEN:
-        i_n = i_nh // H
-        h = i_nh % H
-        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        b = i_n.to(tl.int64)
-    else:
-        b = i_nh // H
-        h = i_nh % H
-        if b >= B:
-            return
-
-    if h >= H:
-        return
-
-    N_chunks = tl.cdiv(T, CHUNK_LEN)
-
-    for i_k in range(tl.cdiv(D, BK)):
-        d_offset = i_k * BK
-        D_range = d_offset + tl.arange(0, BK)
-        D_mask = D_range < D
-
-        sa_ptr = sa + b * sa_stride_b + h * sa_stride_h
-        a_ptr = a + b * a_stride_b + h * a_stride_h + D_range * a_stride_d
-        ac_ptr = ac + b * ac_stride_b + h * ac_stride_h + D_range * ac_stride_d
-
-        if USE_INITIAL_STATE:
-            ac_val = tl.load(h0 + i_nh * D + D_range, mask=D_mask, other=0).to(tl.float32)
-        else:
-            ac_val = tl.zeros([BK], dtype=tl.float32)
-
-        for chunk_id in tl.range(N_chunks):
-            a_val = tl.load(a_ptr, D_mask).to(tl.float32)
-            sa_val = tl.load(sa_ptr).to(tl.float32)
-
-            ac_val = tl.exp(sa_val) * ac_val + a_val
-
-            tl.store(ac_ptr, ac_val, mask=D_mask)
-
-            sa_ptr += sa_stride_c
-            a_ptr += a_stride_c
-            ac_ptr += ac_stride_c
-
-
-@triton.heuristics({
-    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
-@triton.jit(do_not_specialize=['T'])
-def _forward_chunk_out(
-    k,                # *f32 [B, T, H, D]
-    beta,             # *f32 [B, T, H]
-    log_g,            # *f32 [B, T, H]
-    ac,               # *f32 [B, C, H, D]
-    h0,               # *f32 [N, H, D] or None
-    k_precond,        # *f32 [B, T, H, D]
-    log_atk_scale,    # *f32 [H] - per-head log-space center (learnable or fixed)
-    logx,             # scalar float32 - log(x) for squash range
-    eps,              # scalar float32 - epsilon for log safety
+@triton.jit(do_not_specialize=['T', 'chunk_offset'])
+def _forward_chunk_out_npu(
+    k,
+    beta,
+    log_g,
+    ac,
+    h0,
+    k_precond,
+    log_atk_scale,
+    logx,
+    eps,
     cu_seqlens,
     chunk_indices,
     B: tl.constexpr,
@@ -215,10 +167,11 @@ def _forward_chunk_out(
     BK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    chunk_offset,
 ):
     i_t = tl.program_id(0)
     h = tl.program_id(1)
-    chunk_id = tl.program_id(2).to(tl.int64)
+    chunk_id = tl.program_id(2).to(tl.int64) + chunk_offset
 
     if IS_VARLEN:
         i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
@@ -305,53 +258,90 @@ def _forward_chunk_out(
         tl.store(kp_ptr, k_precond_val, mask=mask_T[:, None] * mask_D[None, :])
 
 
-def _atk_fwd_stages(
+def _atk_fwd_stages_npu_packed(
     k: torch.Tensor,
     beta: torch.Tensor,
     log_g: torch.Tensor,
     chunk_size: int,
     initial_A_state: torch.Tensor | None,
     output_final_state: bool,
-    cu_seqlens: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
     x: float,
     eps: float,
     log_atk_scale: torch.Tensor | None,
 ):
-    """Run the 3-stage ATK forward algorithm.
+    """Packed varlen ATK on NPU: run the working batched kernels per sequence.
 
-    Returns:
-        k_precond, ac, a, sa, at
+    Triton-Ascend IS_VARLEN kernels for chunk_summary/chunk_out disagree with
+    the batched path (and with naive ATK) even for a single packed sequence.
     """
     B, T, H, D = k.shape
-    CHUNK_LEN = chunk_size
+    assert B == 1, "packed varlen ATK expects batch size 1"
+    CHUNK_LEN = _NPU_CHUNK_LEN
+    N = len(cu_seqlens) - 1
+    seq_lens = [(int(cu_seqlens[i + 1]) - int(cu_seqlens[i])) for i in range(N)]
+    max_chunks = max((math.ceil(s / CHUNK_LEN) if s > 0 else 0) for s in seq_lens)
+    max_chunks = max(max_chunks, 1)
 
-    BK = D if os.environ.get('ATK_NO_KTILE') else 32  # K-tile size (set ATK_NO_KTILE=1 to disable)
+    a = torch.zeros(N, max_chunks, H, D, dtype=torch.float32, device=k.device)
+    sa = torch.zeros(N, max_chunks, H, dtype=torch.float32, device=k.device)
+    ac = torch.zeros(N, max_chunks, H, D, dtype=torch.float32, device=k.device)
+    k_precond = torch.zeros_like(k)
+    at_rows = []
 
-    is_varlen = cu_seqlens is not None
+    for i in range(N):
+        bos, eos = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+        if eos <= bos:
+            if output_final_state:
+                at_rows.append(ac[i, 0])
+            continue
+        h0_i = None if initial_A_state is None else initial_A_state[i:i + 1]
+        kp_i, ac_i, a_i, sa_i, at_i = _atk_fwd_stages_npu_batched(
+            k[:, bos:eos],
+            beta[:, bos:eos],
+            log_g[:, bos:eos],
+            chunk_size,
+            h0_i,
+            output_final_state,
+            x,
+            eps,
+            log_atk_scale,
+        )
+        k_precond[:, bos:eos] = kp_i
+        nc = a_i.shape[1]
+        a[i, :nc] = a_i[0]
+        sa[i, :nc] = sa_i[0]
+        ac[i, :nc] = ac_i[0]
+        if output_final_state:
+            at_rows.append(at_i[0] if at_i is not None else ac[i, nc - 1])
 
-    if is_varlen:
-        from fla.ops.utils import prepare_chunk_indices
-        N = len(cu_seqlens) - 1
-        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_LEN)
-        NT = len(chunk_indices)
+    at = torch.stack(at_rows, dim=0).to(k.dtype) if output_final_state else None
+    return k_precond.to(k.dtype), ac, a, sa, at
 
-        seq_lens = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(N)]
-        max_chunks = max(triton.cdiv(s.item(), CHUNK_LEN) for s in seq_lens)
 
-        a = torch.empty(N, max_chunks, H, D, dtype=torch.float32, device=k.device)
-        sa = torch.empty(N, max_chunks, H, dtype=torch.float32, device=k.device)
-        ac = torch.empty(N, max_chunks, H, D, dtype=torch.float32, device=k.device)
-    else:
-        N = B
-        num_chunks = math.ceil(T / CHUNK_LEN)
-        chunk_indices = None
-        NT = B * num_chunks
+def _atk_fwd_stages_npu_batched(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    log_g: torch.Tensor,
+    chunk_size: int,
+    initial_A_state: torch.Tensor | None,
+    output_final_state: bool,
+    x: float,
+    eps: float,
+    log_atk_scale: torch.Tensor | None,
+):
+    del chunk_size
+    B, T, H, D = k.shape
+    CHUNK_LEN = _NPU_CHUNK_LEN
+    BK = D if os.environ.get('ATK_NO_KTILE') else 32
+    num_chunks = math.ceil(T / CHUNK_LEN)
 
-        a = torch.empty(B, num_chunks, H, D, dtype=torch.float32, device=k.device)
-        sa = torch.empty(B, num_chunks, H, dtype=torch.float32, device=k.device)
-        ac = torch.empty(B, num_chunks, H, D, dtype=torch.float32, device=k.device)
-
-    k_precond = torch.empty_like(k)
+    a = torch.zeros(B, num_chunks, H, D, dtype=torch.float32, device=k.device)
+    sa = torch.zeros(B, num_chunks, H, dtype=torch.float32, device=k.device)
+    ac = torch.zeros(B, num_chunks, H, D, dtype=torch.float32, device=k.device)
+    # NPU tests poison torch.empty* with NaN. Triton-Ascend masked stores can
+    # RMW destination lanes, so leftover NaNs leak into k_precond.
+    k_precond = torch.zeros_like(k)
 
     k = k.contiguous()
     beta = beta.contiguous()
@@ -364,64 +354,73 @@ def _atk_fwd_stages(
 
     logx = math.log(x) if x > 0 else 0.0
 
-    if is_varlen:
-        grid = (NT, H, 1)
-        grid2 = (N * H,)
-    else:
-        grid = (B, H, num_chunks)
-        grid2 = (B * H,)
+    def _launch_chunk_grid(kernel, args):
+        max_c = max(1, ASCEND_LAUNCH_BLOCK_BUDGET // max(B * H, 1))
+        for off in range(0, num_chunks, max_c):
+            n = min(max_c, num_chunks - off)
+            kernel[(B, H, n)](*args, chunk_offset=off)
 
-    _forward_chunk_summary[grid](
-        k, beta, log_g, a, sa,
-        cu_seqlens, chunk_indices,
-        B, T, H, D, CHUNK_LEN,
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        beta.stride(0), beta.stride(1), beta.stride(2),
-        log_g.stride(0), log_g.stride(1), log_g.stride(2),
-        a.stride(0), a.stride(1), a.stride(2), a.stride(3),
-        sa.stride(0), sa.stride(1), sa.stride(2),
-        BK, num_warps=4
+    _launch_chunk_grid(
+        _forward_chunk_summary_npu,
+        (
+            k, beta, log_g, a, sa,
+            None, None,
+            B, T, H, D, CHUNK_LEN,
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            beta.stride(0), beta.stride(1), beta.stride(2),
+            log_g.stride(0), log_g.stride(1), log_g.stride(2),
+            a.stride(0), a.stride(1), a.stride(2), a.stride(3),
+            sa.stride(0), sa.stride(1), sa.stride(2),
+            BK,
+        ),
     )
 
-    _forward_pass_chunks[grid2](
-        a, sa, ac,
-        initial_A_state,
-        cu_seqlens,
-        B if not is_varlen else N, T, H, D, CHUNK_LEN,
-        a.stride(0), a.stride(1), a.stride(2), a.stride(3),
-        sa.stride(0), sa.stride(1), sa.stride(2),
-        ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
-        BK, num_warps=4
+    atk_forward_pass_chunks_torch(a, sa, ac, initial_A_state, None, CHUNK_LEN)
+
+    _launch_chunk_grid(
+        _forward_chunk_out_npu,
+        (
+            k, beta, log_g, ac, initial_A_state, k_precond,
+            log_atk_scale, logx, eps,
+            None, None,
+            B, T, H, D, CHUNK_LEN,
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            beta.stride(0), beta.stride(1), beta.stride(2),
+            log_g.stride(0), log_g.stride(1), log_g.stride(2),
+            ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
+            k_precond.stride(0), k_precond.stride(1), k_precond.stride(2), k_precond.stride(3),
+            BK,
+        ),
     )
 
-    _forward_chunk_out[grid](
-        k, beta, log_g, ac, initial_A_state, k_precond,
-        log_atk_scale, logx, eps,
-        cu_seqlens, chunk_indices,
-        B, T, H, D, CHUNK_LEN,
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        beta.stride(0), beta.stride(1), beta.stride(2),
-        log_g.stride(0), log_g.stride(1), log_g.stride(2),
-        ac.stride(0), ac.stride(1), ac.stride(2), ac.stride(3),
-        k_precond.stride(0), k_precond.stride(1), k_precond.stride(2), k_precond.stride(3),
-        BK,
-        num_warps=4
-    )
-
-    at = None
-    if output_final_state:
-        if is_varlen:
-            seq_lens = [cu_seqlens[i + 1] - cu_seqlens[i] for i in range(N)]
-            last_chunk_indices = [triton.cdiv(s.item(), CHUNK_LEN) - 1 for s in seq_lens]
-            at = torch.stack([ac[i, last_chunk_indices[i], :, :] for i in range(N)], dim=0).to(k.dtype)
-        else:
-            at = ac[:, -1, :, :].contiguous().to(k.dtype)
-
+    at = ac[:, -1, :, :].contiguous().to(k.dtype) if output_final_state else None
     return k_precond.to(k.dtype), ac, a, sa, at
 
 
-@dispatch('atk')
-def chunk_atk_fwd(
+def _atk_fwd_stages_npu(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    log_g: torch.Tensor,
+    chunk_size: int,
+    initial_A_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None,
+    x: float,
+    eps: float,
+    log_atk_scale: torch.Tensor | None,
+):
+    if cu_seqlens is not None:
+        return _atk_fwd_stages_npu_packed(
+            k, beta, log_g, chunk_size, initial_A_state, output_final_state,
+            cu_seqlens, x, eps, log_atk_scale,
+        )
+    return _atk_fwd_stages_npu_batched(
+        k, beta, log_g, chunk_size, initial_A_state, output_final_state,
+        x, eps, log_atk_scale,
+    )
+
+
+def chunk_atk_fwd_npu(
     k: torch.Tensor,
     beta: torch.Tensor,
     log_g: torch.Tensor = None,
@@ -433,10 +432,7 @@ def chunk_atk_fwd(
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
 ):
-    r"""
-    Chunked ATK forward: computes preconditioned keys via 3-stage chunk algorithm.
-    """
-    k_precond, _, _, _, at = _atk_fwd_stages(
+    k_precond, _, _, _, at = _atk_fwd_stages_npu(
         k, beta, log_g, chunk_size,
         initial_A_state, output_final_state, cu_seqlens,
         x, eps, log_atk_scale,
@@ -444,8 +440,7 @@ def chunk_atk_fwd(
     return k_precond, at
 
 
-@dispatch('atk')
-def recompute_atk_fwd(
+def recompute_atk_fwd_npu(
     k: torch.Tensor,
     beta: torch.Tensor,
     log_g: torch.Tensor,
@@ -456,10 +451,7 @@ def recompute_atk_fwd(
     eps: float = 1e-6,
     log_atk_scale: torch.Tensor = None,
 ):
-    r"""
-    Recompute ATK forward intermediates for use in backward pass.
-    """
-    k_precond, ac, a, sa, _ = _atk_fwd_stages(
+    k_precond, ac, a, sa, _ = _atk_fwd_stages_npu(
         k, beta, log_g, chunk_size,
         initial_A_state, False, cu_seqlens,
         x, eps, log_atk_scale,

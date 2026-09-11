@@ -152,23 +152,40 @@ def _get_dqkwg_full_tiles(BT: int, K: int, V: int, use_dw: bool) -> tuple[int, i
     return None
 
 
-_HDH_BK_CANDIDATES = (256, 128, 64, 32, 16)
-_HDH_BV_CANDIDATES = (256, 128, 64, 32, 16)
+_HDH_BK_CANDIDATES = (64, 32, 16)
+_HDH_BV_CANDIDATES = (64, 32, 16)
+
+
+def _hdh_peak_bytes(BK: int, BV: int) -> int:
+    """UB for Vector-core <h, dh>: fp16 loads (multi-buffer), transpose, fp32 cast.
+
+    The old 2*BK*BV*2 + BK*BV*4 model missed transpose/cast/vreduce copies.
+    D=100 with 128×128 tiles PlanMemory-fails (~500 KiB live vs 192 KiB UB)
+    because leftover 100×100 subviews keep those copies alive.
+    """
+    tile = BK * BV
+    return (
+        2 * tile * 2 * 2  # h, dh fp16 × multi_buffer
+        + 2 * tile * 2    # transposes
+        + 2 * tile * 4    # fp32 casts
+        + 2 * tile * 4    # mul + leftover-mask copy
+        + tile * 4        # vreduce temp
+        + BK * 4
+    )
 
 
 def _get_hdh_tiles(K: int, V: int) -> tuple[int, int]:
     """Tiles for the Vector-only Frobenius <h, dh> kernel."""
     ub_budget = int(_UB_BYTES * _SAFETY_MARGIN)
-    k_cap = min(256, triton.next_power_of_2(K))
-    v_cap = min(256, triton.next_power_of_2(V))
+    k_cap = min(64, triton.next_power_of_2(K))
+    v_cap = min(64, triton.next_power_of_2(V))
     for BK in _HDH_BK_CANDIDATES:
         if k_cap < BK:
             continue
         for BV in _HDH_BV_CANDIDATES:
             if v_cap < BV:
                 continue
-            peak = 2 * BK * BV * 2 + BK * BV * 4 + BK * 4
-            if peak <= ub_budget:
+            if _hdh_peak_bytes(BK, BV) <= ub_budget:
                 return BK, BV
     return 16, 16
 
@@ -205,14 +222,6 @@ def get_npu_properties():
         "USE_G_GAMMA": lambda args: args["g_gamma"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': 128}),
-        triton.Config({'BK': 64}),
-        triton.Config({'BK': 32}),
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
 )
 @triton.jit(do_not_specialize=["T", "total_chunks", "task_num", "num_core", "H", "HV", "K", "V", "N"])
 def chunk_fwd_kernel_o_npu(
@@ -278,6 +287,9 @@ def chunk_fwd_kernel_o_npu(
 
         b_o = tl.zeros([BT, BV], dtype=tl.float32)
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T_cur
+        o_v = i_v * BV + tl.arange(0, BV)
 
         for i_k in range(tl.cdiv(K, BK)):
             p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -286,12 +298,19 @@ def chunk_fwd_kernel_o_npu(
                 p_h = tl.make_block_ptr(h_base, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
             else:
                 p_h = tl.make_block_ptr(h_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_tk = m_t[:, None] & (o_k < K)[None, :]
+            m_kt = (o_k < K)[:, None] & m_t[None, :]
             # [BT, BK]
-            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_q = tl.where(m_tk, tl.load(p_q, boundary_check=(0, 1)), 0)
             # [BK, BT]
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            # [BK, BV]
+            b_k = tl.where(m_kt, tl.load(p_k, boundary_check=(0, 1)), 0)
+            # [BK, BV] or [BV, BK]
             b_h = tl.load(p_h, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_h = tl.where((o_v[:, None] < V) & (o_k < K)[None, :], b_h, 0)
+            else:
+                b_h = tl.where((o_k[:, None] < K) & (o_v < V)[None, :], b_h, 0)
 
             # Ascend tl.dot clobbers lhs; copy before the first dot on b_q.
             b_q_c = b_q + 0.0
@@ -302,6 +321,8 @@ def chunk_fwd_kernel_o_npu(
                 b_o = tl.dot(b_q, b_h, b_o)
             # [BT, BK] @ [BK, BT] -> [BT, BT]
             b_A = tl.dot(b_q_c, b_k, b_A)
+
+        m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
 
         if USE_G:
             # g is transposed to [B, HV, T] in wrapper for contiguous T-load.
@@ -314,27 +335,32 @@ def chunk_fwd_kernel_o_npu(
             p_g = tl.make_block_ptr(g_ptr, (T_cur,), (1,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
 
-            b_o = b_o * exp2(b_g)[:, None]
-            b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+            # mask first so upper-triangle / padding g_i-g_j cannot overflow to inf.
+            # leftover chunks load OOB g as 0, and large |g| (e.g. gln=0.01) makes
+            # exp2(0 - g_valid) overflow; inf then contaminates the causal tile.
+            b_g_diff = tl.where(m_A, b_g[:, None] - b_g[None, :], 0)
+            b_o = b_o * tl.where(m_t, exp2(b_g), 0)[:, None]
+            b_A = b_A * exp2(b_g_diff)
         if USE_G_GAMMA:
             b_gamma = tl.load(g_gamma + i_h)
             b_g = b_gamma * (tl.arange(0, BT) + 1)
-            b_o = b_o * exp2(b_g)[:, None]
-            b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+            b_g_diff = tl.where(m_A, b_g[:, None] - b_g[None, :], 0)
+            b_o = b_o * tl.where(m_t, exp2(b_g), 0)[:, None]
+            b_A = b_A * exp2(b_g_diff)
 
-        o_t = i_t * BT + tl.arange(0, BT)
-        m_t = o_t < T_cur
-        m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
         b_A = tl.where(m_A, b_A, 0)
 
         p_v = tl.make_block_ptr(v_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_o = tl.make_block_ptr(o_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        m_tv = m_t[:, None] & (o_v < V)[None, :]
+        b_v = tl.where(m_tv, tl.load(p_v, boundary_check=(0, 1)), 0)
         # to fix mma -> mma layout conversion
         # already solved by triton v3.2 or higher
         b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            o_ptr + o_t[:, None] * (HV * V) + o_v[None, :],
+            b_o.to(o.dtype.element_ty),
+            mask=m_tv,
+        )
 
 
 @input_guard
@@ -356,7 +382,9 @@ def chunk_fwd_o_npu(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    # zeros: Triton-Ascend masked/boundary stores can RMW destination lanes,
+    # so NaN-poisoned empty buffers leak into valid leftover-chunk tokens.
+    o = torch.zeros_like(v)
     if cu_seqlens is None:
         N, chunk_offsets = B, None
         NT = triton.cdiv(T, BT)
@@ -369,7 +397,8 @@ def chunk_fwd_o_npu(
         # chunk_offsets[-1] stores the cumulative total chunks across all batches
         total_chunks = chunk_offsets[-1].item()
 
-    BV = 128
+    BK = min(_MAX_BK, triton.next_power_of_2(K))
+    BV = min(_MAX_BV, triton.next_power_of_2(V))
     NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()["num_aicore"]
     task_num = NV * HV * total_chunks
@@ -397,6 +426,7 @@ def chunk_fwd_o_npu(
         task_num=task_num,
         num_core=num_core,
         BT=BT,
+        BK=BK,
         BV=BV,
         STATE_V_FIRST=state_v_first,
     )
@@ -516,28 +546,34 @@ def chunk_bwd_kernel_dv_local_full_npu(
             b_g = b_gamma * (tl.arange(0, BT) + 1)
 
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T_cur
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             p_q = tl.make_block_ptr(q_ptr, (K, T_cur), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
+            o_k = i_k * BK + tl.arange(0, BK)
+            b_k = tl.where(m_t[:, None] & (o_k < K)[None, :], tl.load(p_k, boundary_check=(0, 1)), 0)
+            b_q = tl.where((o_k < K)[:, None] & m_t[None, :], tl.load(p_q, boundary_check=(0, 1)), 0)
             b_A += tl.dot(b_k, b_q, allow_tf32=False) * scale
-        if USE_G or USE_G_GAMMA:
-            b_A *= exp2(b_g[None, :] - b_g[:, None])
-
-        o_t = i_t * BT + tl.arange(0, BT)
-        m_t = o_t < T_cur
         m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
+        if USE_G or USE_G_GAMMA:
+            # mask first: leftover g loads as 0 and exp2(0 - g_valid) overflows.
+            b_A *= exp2(tl.where(m_A, b_g[None, :] - b_g[:, None], 0))
         b_A = tl.where(m_A, b_A, 0)
         b_A_pristine = b_A + 0.0
 
         for i_v in range(tl.cdiv(V, BV)):
             p_do = tl.make_block_ptr(do_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_dv = tl.make_block_ptr(dv_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            b_do = tl.load(p_do, boundary_check=(0, 1))
+            o_v = i_v * BV + tl.arange(0, BV)
+            m_tv = m_t[:, None] & (o_v < V)[None, :]
+            b_do = tl.where(m_tv, tl.load(p_do, boundary_check=(0, 1)), 0)
             b_A_i = b_A_pristine + 0.0
             b_dv = tl.dot(b_A_i.to(b_do.dtype), b_do, allow_tf32=False)
-            tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                dv_ptr + o_t[:, None] * (HV * V) + o_v[None, :],
+                b_dv.to(dv.dtype.element_ty),
+                mask=m_tv,
+            )
 
 
 @triton.jit(do_not_specialize=['T'])
@@ -799,9 +835,18 @@ def chunk_bwd_kernel_dqkwg_npu(
             p_dv = tl.make_block_ptr(dv, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             b_h = tl.load(p_h, boundary_check=(0, 1))
             b_dv = tl.load(p_dv, boundary_check=(0, 1))
+            o_v_dw = i_v * BV + tl.arange(0, BV)
+            o_k_h = i_k * BK + tl.arange(0, BK)
+            o_t_h = i_t * BT + tl.arange(0, BT)
+            m_tv_dw = (o_t_h < T)[:, None] & (o_v_dw < V)[None, :]
+            m_vk_dw = (o_v_dw[:, None] < V) & (o_k_h < K)[None, :]
+            b_h = tl.where(m_vk_dw, b_h, 0)
+            b_dv = tl.where(m_tv_dw, b_dv, 0)
             b_dw = tl.dot(b_dv.to(b_h.dtype), b_h.to(b_h.dtype), b_dw, allow_tf32=False)
-        p_dw = tl.make_block_ptr(dw, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
+        o_t_dw = i_t * BT + tl.arange(0, BT)
+        o_k_dw = i_k * BK + tl.arange(0, BK)
+        m_dw = (o_t_dw < T)[:, None] & (o_k_dw < K)[None, :]
+        tl.store(dw + o_t_dw[:, None] * (HV * K) + o_k_dw[None, :], -b_dw.to(dw.dtype.element_ty), mask=m_dw)
 
     tl.debug_barrier()
 
@@ -824,6 +869,10 @@ def chunk_bwd_kernel_dqkwg_npu(
                 p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
             b_do_r = tl.load(p_do_r, boundary_check=(0, 1))
             b_h = tl.load(p_h, boundary_check=(0, 1))
+            o_v_r = i_v * BV + tl.arange(0, BV)
+            o_k_r = i_k * BK + tl.arange(0, BK)
+            b_do_r = tl.where(m_r[:, None] & (o_v_r < V)[None, :], b_do_r, 0)
+            b_h = tl.where((o_v_r[:, None] < V) & (o_k_r < K)[None, :], b_h, 0)
             b_dq_r = tl.dot(b_do_r, b_h.to(b_do_r.dtype), b_dq_r, allow_tf32=False)
 
         if USE_G:
@@ -835,7 +884,8 @@ def chunk_bwd_kernel_dqkwg_npu(
             b_dq_r = b_dq_r * exp2(b_gr)[:, None] * scale
 
         p_q_r = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc_r, i_k * BK), (BC, BK), (1, 0))
-        b_q_r = tl.load(p_q_r, boundary_check=(0, 1))
+        o_k_qr = i_k * BK + tl.arange(0, BK)
+        b_q_r = tl.where(m_r[:, None] & (o_k_qr < K)[None, :], tl.load(p_q_r, boundary_check=(0, 1)), 0)
 
         for c in range(r + 1):
             i_tc_c = i_t * BT + c * BC
@@ -846,6 +896,9 @@ def chunk_bwd_kernel_dqkwg_npu(
                 p_v_c = tl.make_block_ptr(v, (T, V), (HV * V, 1), (i_tc_c, i_v * BV), (BC, BV), (1, 0))
                 b_do_r2 = tl.load(p_do_r2, boundary_check=(0, 1))
                 b_v_c = tl.load(p_v_c, boundary_check=(0, 1))
+                o_v_c = i_v * BV + tl.arange(0, BV)
+                b_do_r2 = tl.where(m_r[:, None] & (o_v_c < V)[None, :], b_do_r2, 0)
+                b_v_c = tl.where(m_c[:, None] & (o_v_c < V)[None, :], b_v_c, 0)
                 b_ds = tl.dot(b_do_r2, tl.trans(b_v_c), b_ds, allow_tf32=False)
 
             if USE_G:
@@ -861,7 +914,8 @@ def chunk_bwd_kernel_dqkwg_npu(
             else:
                 m_blk = m_r[:, None] & m_c
             p_k_c = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc_c, i_k * BK), (BC, BK), (1, 0))
-            b_k_c = tl.load(p_k_c, boundary_check=(0, 1))
+            o_k_c = i_k * BK + tl.arange(0, BK)
+            b_k_c = tl.where(m_c[:, None] & (o_k_c < K)[None, :], tl.load(p_k_c, boundary_check=(0, 1)), 0)
             b_ds = tl.where(m_blk, b_ds, 0).to(b_k_c.dtype)
             b_ds_c = b_ds + 0.0
             b_dq_r = tl.dot(b_ds, b_k_c, b_dq_r, allow_tf32=False)
@@ -877,10 +931,11 @@ def chunk_bwd_kernel_dqkwg_npu(
         if not USE_G and not USE_G_GAMMA:
             b_dq_r *= scale
 
-        p_dq_r = tl.make_block_ptr(dq, (T, K), (HV * K, 1), (i_tc_r, i_k * BK), (BC, BK), (1, 0))
-        p_dq_f32_r = tl.make_block_ptr(dq_f32, (T, K), (HV * K, 1), (i_tc_r, i_k * BK), (BC, BK), (1, 0))
-        tl.store(p_dq_r, b_dq_r.to(p_dq_r.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_dq_f32_r, b_dq_r, boundary_check=(0, 1))
+        o_k = i_k * BK + tl.arange(0, BK)
+        o_tr = i_tc_r + o_i
+        m_qk_r = m_r[:, None] & (o_k < K)[None, :]
+        tl.store(dq + o_tr[:, None] * (HV * K) + o_k[None, :], b_dq_r.to(dq.dtype.element_ty), mask=m_qk_r)
+        tl.store(dq_f32 + o_tr[:, None] * (HV * K) + o_k[None, :], b_dq_r, mask=m_qk_r)
 
     # Finalize dk: gated inter (v@dh) + fused intra from scratch.
     for c in range(n_sub):
@@ -895,6 +950,10 @@ def chunk_bwd_kernel_dqkwg_npu(
                 p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
             b_v = tl.load(p_v, boundary_check=(0, 1))
             b_dh = tl.load(p_dh, boundary_check=(0, 1))
+            o_v_c = i_v * BV + tl.arange(0, BV)
+            o_k_c = i_k * BK + tl.arange(0, BK)
+            b_v = tl.where(m_c[:, None] & (o_v_c < V)[None, :], b_v, 0)
+            b_dh = tl.where((o_v_c[:, None] < V) & (o_k_c < K)[None, :], b_dh, 0)
             b_dk_c = tl.dot(b_v.to(tl.float32), b_dh.to(tl.float32), b_dk_c, allow_tf32=False)
 
         if USE_G:
@@ -907,9 +966,11 @@ def chunk_bwd_kernel_dqkwg_npu(
 
         p_dk_acc = tl.make_block_ptr(dk_f32, (T, K), (HV * K, 1), (i_tc_c, i_k * BK), (BC, BK), (1, 0))
         b_dk_c += tl.load(p_dk_acc, boundary_check=(0, 1))
-        p_dk_c = tl.make_block_ptr(dk, (T, K), (HV * K, 1), (i_tc_c, i_k * BK), (BC, BK), (1, 0))
-        tl.store(p_dk_c, b_dk_c.to(p_dk_c.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_dk_acc, b_dk_c, boundary_check=(0, 1))
+        o_k = i_k * BK + tl.arange(0, BK)
+        o_tc = i_tc_c + o_i
+        m_qk_c = m_c[:, None] & (o_k < K)[None, :]
+        tl.store(dk + o_tc[:, None] * (HV * K) + o_k[None, :], b_dk_c.to(dk.dtype.element_ty), mask=m_qk_c)
+        tl.store(dk_f32 + o_tc[:, None] * (HV * K) + o_k[None, :], b_dk_c, mask=m_qk_c)
 
 
 @triton.jit(do_not_specialize=['T', 'task_num', 'num_core'])
@@ -1012,6 +1073,10 @@ def chunk_bwd_kernel_dqkwg_full_npu(
             p_do = tl.make_block_ptr(do_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             b_v = tl.load(p_v, boundary_check=(0, 1))
             b_do = tl.load(p_do, boundary_check=(0, 1))
+            o_v = i_v * BV + tl.arange(0, BV)
+            m_tv = m_t[:, None] & (o_v < V)[None, :]
+            b_v = tl.where(m_tv, b_v, 0)
+            b_do = tl.where(m_tv, b_do, 0)
             b_ds = tl.dot(b_do, tl.trans(b_v), b_ds, allow_tf32=False)
 
         if USE_G or USE_G_GAMMA:
@@ -1039,21 +1104,36 @@ def chunk_bwd_kernel_dqkwg_full_npu(
                 b_do = tl.load(p_do, boundary_check=(0, 1))
                 b_h = tl.load(p_h, boundary_check=(0, 1))
                 b_dh = tl.load(p_dh, boundary_check=(0, 1))
+                o_v = i_v * BV + tl.arange(0, BV)
+                o_k = i_k * BK + tl.arange(0, BK)
+                m_tv = m_t[:, None] & (o_v < V)[None, :]
+                m_vk = (o_v[:, None] < V) & (o_k < K)[None, :]
+                b_v = tl.where(m_tv, b_v, 0)
+                b_do = tl.where(m_tv, b_do, 0)
+                b_h = tl.where(m_vk, b_h, 0)
+                b_dh = tl.where(m_vk, b_dh, 0)
                 b_dq = tl.dot(b_do, b_h.to(b_do.dtype), b_dq, allow_tf32=False)
                 b_dk = tl.dot(b_v, b_dh.to(b_v.dtype), b_dk, allow_tf32=False)
                 if USE_DW:
                     p_dv = tl.make_block_ptr(dv_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    b_dv = tl.load(p_dv, boundary_check=(0, 1))
+                    b_dv = tl.where(m_tv, tl.load(p_dv, boundary_check=(0, 1)), 0)
                     b_dw = tl.dot(b_dv.to(b_h.dtype), b_h.to(b_h.dtype), b_dw, allow_tf32=False)
 
             if USE_DW:
-                p_dw = tl.make_block_ptr(dw_ptr, (T_cur, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
+                o_k_dw = i_k * BK + tl.arange(0, BK)
+                m_dw = m_t[:, None] & (o_k_dw < K)[None, :]
+                tl.store(
+                    dw_ptr + o_t[:, None] * (HV * K) + o_k_dw[None, :],
+                    (-b_dw).to(dw_ptr.dtype.element_ty),
+                    mask=m_dw,
+                )
 
             p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             p_k = tl.make_block_ptr(k_ptr, (T_cur, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_qk = m_t[:, None] & (o_k < K)[None, :]
+            b_q = tl.where(m_qk, tl.load(p_q, boundary_check=(0, 1)), 0)
+            b_k = tl.where(m_qk, tl.load(p_k, boundary_check=(0, 1)), 0)
 
             b_ds_lhs = b_ds_keep + 0.0
             b_ds_rhs = b_ds_keep + 0.0
@@ -1068,16 +1148,25 @@ def chunk_bwd_kernel_dqkwg_full_npu(
                 b_dq = b_dq * scale + tl.dot(b_ds_lhs, b_k, allow_tf32=False)
                 b_dk = tl.dot(tl.trans(b_ds_rhs), b_q, b_dk, allow_tf32=False)
 
-            p_dq = tl.make_block_ptr(dq_ptr, (T_cur, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            p_dk = tl.make_block_ptr(dk_ptr, (T_cur, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
-            tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
+            # Masked stores: boundary_check RMW of leftover T/K tiles spills into
+            # the next batch when K is not 32-aligned (CANN 32-size padding).
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_qk = m_t[:, None] & (o_k < K)[None, :]
+            tl.store(
+                dq_ptr + o_t[:, None] * (HV * K) + o_k[None, :],
+                b_dq.to(dq_ptr.dtype.element_ty),
+                mask=m_qk,
+            )
+            tl.store(
+                dk_ptr + o_t[:, None] * (HV * K) + o_k[None, :],
+                b_dk.to(dk_ptr.dtype.element_ty),
+                mask=m_qk,
+            )
             if USE_G:
                 b_dg = tl.sum(b_dq * b_q.to(tl.float32), axis=1) - tl.sum(b_dk * b_k.to(tl.float32), axis=1)
                 b_dg = tl.where(o_t < last_idx, b_dg, b_dg + b_dg_last)
                 dg_k = dg_head + tl.cast(i_k, tl.int64) * tl.cast(B, tl.int64) * tl.cast(T_seq, tl.int64) * HV
-                p_dg = tl.make_block_ptr(dg_k, (T_cur,), (HV,), (i_t * BT,), (BT,), (0,))
-                tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
+                tl.store(dg_k + o_t * HV, b_dg.to(dg_k.dtype.element_ty), mask=m_t)
 
 
 @triton.jit(do_not_specialize=['T', 'task_num', 'num_core'])
@@ -1147,7 +1236,10 @@ def chunk_bwd_kernel_dg_hdh_npu(
                     p_dh = tl.make_block_ptr(dh_ptr, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
                 b_h = tl.load(p_h, boundary_check=(0, 1)).to(tl.float32)
                 b_dh = tl.load(p_dh, boundary_check=(0, 1)).to(tl.float32)
-                acc += tl.sum(tl.sum(b_h * b_dh, axis=1))
+                o_k = i_k * BK + tl.arange(0, BK)
+                o_v = i_v * BV + tl.arange(0, BV)
+                m_vk = (o_v[:, None] < V) & (o_k < K)[None, :]
+                acc += tl.sum(tl.sum(tl.where(m_vk, b_h * b_dh, 0.0), axis=1))
 
         dg_ptr = dg + bos * HV + i_h
         p_last = dg_ptr + tl.cast(last_idx, tl.int64) * HV
@@ -1320,7 +1412,7 @@ def chunk_bwd_dv_local_npu(
         g_arg = q
         g_t_contig = False
 
-    dv = torch.empty_like(do)
+    dv = torch.zeros_like(do)
     kernel_kwargs = {
         'q': q,
         'k': k,
@@ -1402,18 +1494,20 @@ def chunk_bwd_dqkwg_npu(
         BK = _get_bk(K, BC)
         BV = _get_bv(V, BC)
         dqkwg_kernel = chunk_bwd_kernel_dqkwg_npu
-        dq_f32 = torch.empty(B, T, HV, K, dtype=torch.float32, device=q.device)
-        dk_f32 = torch.empty(B, T, HV, K, dtype=torch.float32, device=q.device)
+        dq_f32 = torch.zeros(B, T, HV, K, dtype=torch.float32, device=q.device)
+        dk_f32 = torch.zeros(B, T, HV, K, dtype=torch.float32, device=q.device)
     NK = triton.cdiv(K, BK)
     if g is not None:
         g_arg, g_t_contig = _g_npu_arg(g, HV)
     else:
         g_arg = q
         g_t_contig = False
-    dq = q.new_empty(B, T, HV, K)
-    dk = k.new_empty(B, T, HV, K)
-    dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
-    dw = torch.empty_like(w) if use_dw else None
+    # zeros: Triton-Ascend boundary_check stores can RMW destination lanes, so
+    # leftover-T padding of one batch's last chunk spills into the next batch.
+    dq = q.new_zeros(B, T, HV, K)
+    dk = k.new_zeros(B, T, HV, K)
+    dg = torch.zeros(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
+    dw = torch.zeros_like(w) if use_dw else None
 
     dqkwg_kwargs = {
         'q': q,

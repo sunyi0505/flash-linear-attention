@@ -9,9 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.backends import dispatch
 from fla.ops.utils.op import exp
-from fla.utils import input_guard
+from fla.utils import ascend_compile_kwargs, input_guard
 
 
 @triton.heuristics({
@@ -207,7 +206,6 @@ def fused_recurrent_precond_gated_delta_rule_fwd_kernel(
             tl.store(p_at, b_a.to(p_at.dtype.element_ty), mask=mask_k)
 
 
-@dispatch('precond_gated_delta_rule')
 def fused_recurrent_precond_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -283,6 +281,7 @@ def fused_recurrent_precond_gated_delta_rule_fwd(
         TRANSPOSE_STATE=transpose_state_layout,
         num_warps=1,
         num_stages=3,
+        **ascend_compile_kwargs(),
     )
     return o, final_state, final_A_state
 
