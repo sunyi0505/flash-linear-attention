@@ -7,6 +7,13 @@
 
 import sys
 
+from ._ascend_align import (  # noqa: F401
+    npu_leftover_mask,
+    npu_pad,
+    npu_pad_last_dim,
+    npu_pad_state_h,
+    npu_unpad,
+)
 from ._compat import (  # noqa: F401
     SUPPORTS_AUTOTUNE_CACHE,
     TRITON_ABOVE_3_4_0,

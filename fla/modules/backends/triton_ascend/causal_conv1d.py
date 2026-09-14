@@ -1948,23 +1948,21 @@ def causal_conv1d_fwd_npu(
     B, T, D = x.shape[0], x.shape[1], weight.shape[0]
     W = weight.shape[1]
 
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
-
-    if initial_state is None:
-        # ant_AReaL fused block_ptr kernel (fast): bias/silu/residual fused in.
-        y = _launch_fwd_core(
-            x, weight, bias, residual, initial_state, cu_seqlens, chunk_indices,
-            B, T, D, W, BT, activation,
-        )
-    else:
-        # initial_state present: the ant_AReaL kernel's head-edge branch faults the Ascend
-        # vector core on this triton-ascend version, so use the scalar kernel (conv only)
-        # and apply activation/residual afterwards.
+    bd_legacy = 128 if x.dtype in (torch.bfloat16, torch.float16) else 16
+    if initial_state is not None or D % bd_legacy != 0:
+        # leftover D (e.g. 60/200) aliases the next channel through block_ptr DMA;
+        # initial_state also faults the fused kernel on this triton-ascend version.
         y = _launch_fwd_core_scalar(
             x, weight, bias, initial_state, cu_seqlens, cu_seqlens_cpu, B, T, D, W, BT,
         )
         y = _postprocess_fwd(y, residual, activation)
+    else:
+        if cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+        y = _launch_fwd_core(
+            x, weight, bias, residual, initial_state, cu_seqlens, chunk_indices,
+            B, T, D, W, BT, activation,
+        )
 
     final_state = None
     if output_final_state:
@@ -2023,7 +2021,7 @@ def causal_conv1d_bwd_npu(
 
     y_pre = None
     if activation in ('swish', 'silu'):
-        if initial_state is None:
+        if initial_state is None and D % (128 if x.dtype in (torch.bfloat16, torch.float16) else 16) == 0:
             chunk_indices_f = None
             if cu_seqlens is not None:
                 chunk_indices_f = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)

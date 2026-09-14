@@ -15,7 +15,7 @@ import triton.language as tl
 
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
-from fla.utils import input_guard
+from fla.utils import input_guard, npu_leftover_mask, npu_pad, npu_pad_last_dim, npu_unpad
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
@@ -79,6 +79,10 @@ def fused_recurrent_kda_fwd_kernel_npu(
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    KP: tl.constexpr,
+    VP: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     stride_init_state_token: tl.constexpr,
@@ -100,6 +104,7 @@ def fused_recurrent_kda_fwd_kernel_npu(
     APPLY_BETA_SIGMOID: tl.constexpr,
     ALLOW_NEG_EIGVAL: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    MASK_LEFTOVER: tl.constexpr,
 ):
     task_id = tl.program_id(0) + TASK_OFFSET
     NV = tl.cdiv(V, BV)
@@ -126,19 +131,19 @@ def fused_recurrent_kda_fwd_kernel_npu(
         o_k = i_k * BK + tl.arange(0, BK)
         o_v = i_v * BV + tl.arange(0, BV)
 
-        base_qk = (bos * H + i_h) * K
+        base_qk = (bos * H + i_h) * KP
         base_hv = (bos * HV + i_hv)
 
         p_q = q + base_qk + o_k
         p_k = k + base_qk + o_k
-        p_v = v + base_hv * V + o_v
+        p_v = v + base_hv * VP + o_v
         if IS_BETA_HEADWISE:
-            p_beta = beta + base_hv * V + o_v
+            p_beta = beta + base_hv * VP + o_v
         else:
             p_beta = beta + base_hv
 
-        p_g = g + base_hv * K + o_k
-        p_o = o + base_hv * V + o_v
+        p_g = g + base_hv * KP + o_k
+        p_o = o + base_hv * VP + o_v
 
         mask_k = o_k < K
         mask_v = o_v < V
@@ -155,7 +160,9 @@ def fused_recurrent_kda_fwd_kernel_npu(
         if USE_GATE_IN_KERNEL:
             b_A = tl.load(A_log + i_hv).to(tl.float32) if HAS_A else 1.0
             if HAS_BIAS:
-                b_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0).to(tl.float32)
+                b_bias = tl.load(dt_bias + i_hv * KP + o_k, mask=mask_k, other=0).to(tl.float32)
+                if MASK_LEFTOVER:
+                    b_bias = tl.where(mask_k, b_bias, 0)
             else:
                 b_bias = tl.zeros([BK], dtype=tl.float32)
 
@@ -168,25 +175,31 @@ def fused_recurrent_kda_fwd_kernel_npu(
                 state_base = (
                     tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t0).to(tl.int64) * stride_init_state_token
                 )
-                p_h0 = h0 + state_base + i_hv * K * V
+                p_h0 = h0 + state_base + i_hv * KS * VS
             else:
-                p_h0 = h0 + (tl.cast(i_n, tl.int64) * HV + i_hv) * K * V
+                p_h0 = h0 + (tl.cast(i_n, tl.int64) * HV + i_hv) * KS * VS
             if STATE_V_FIRST:
-                p_h0 = p_h0 + o_v[:, None] * K + o_k[None, :]
+                p_h0 = p_h0 + o_v[:, None] * KS + o_k[None, :]
             else:
-                p_h0 = p_h0 + o_k[:, None] * V + o_v[None, :]
+                p_h0 = p_h0 + o_k[:, None] * VS + o_v[None, :]
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+            if MASK_LEFTOVER:
+                b_h = tl.where(mask_h, b_h, 0)
 
-        stride_qk = H * K
-        stride_hv = HV * V
-        stride_g = HV * K
+        stride_qk = H * KP
+        stride_hv = HV * VP
+        stride_g = HV * KP
         stride_beta_scalar = HV
-        stride_beta_headwise = HV * V
+        stride_beta_headwise = HV * VP
 
         for i_t in tl.range(0, T_cur):
             b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
             b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
             b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+            if MASK_LEFTOVER:
+                b_q = tl.where(mask_k, b_q, 0)
+                b_k = tl.where(mask_k, b_k, 0)
+                b_v = tl.where(mask_v, b_v, 0)
 
             if USE_QK_L2NORM_IN_KERNEL:
                 b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6) * scale)
@@ -194,6 +207,8 @@ def fused_recurrent_kda_fwd_kernel_npu(
             else:
                 b_q = b_q * scale
             b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
+            if MASK_LEFTOVER:
+                b_g = tl.where(mask_k, b_g, 0)
 
             if USE_GATE_IN_KERNEL:
                 b_g = b_g + b_bias
@@ -216,6 +231,8 @@ def fused_recurrent_kda_fwd_kernel_npu(
 
             if IS_BETA_HEADWISE:
                 b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+                if MASK_LEFTOVER:
+                    b_beta = tl.where(mask_v, b_beta, 0)
             else:
                 b_beta = tl.load(p_beta).to(tl.float32)
             if APPLY_BETA_SIGMOID:
@@ -237,13 +254,13 @@ def fused_recurrent_kda_fwd_kernel_npu(
                     state_base = (
                         tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(tl.int64) * stride_final_state_token
                     )
-                    p_ht = ht + state_base + i_hv * K * V
+                    p_ht = ht + state_base + i_hv * KS * VS
                 else:
-                    p_ht = ht + (bos + i_t) * stride_final_state_token + i_hv * K * V
+                    p_ht = ht + (bos + i_t) * stride_final_state_token + i_hv * KS * VS
                 if STATE_V_FIRST:
-                    p_ht = p_ht + o_v[:, None] * K + o_k[None, :]
+                    p_ht = p_ht + o_v[:, None] * KS + o_k[None, :]
                 else:
-                    p_ht = p_ht + o_k[:, None] * V + o_v[None, :]
+                    p_ht = p_ht + o_k[:, None] * VS + o_v[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
             p_q += stride_qk
@@ -258,11 +275,11 @@ def fused_recurrent_kda_fwd_kernel_npu(
 
         if not IS_CONTINUOUS_BATCHING:
             if STORE_FINAL_STATE:
-                p_ht = ht + (tl.cast(i_n, tl.int64) * HV + i_hv) * K * V
+                p_ht = ht + (tl.cast(i_n, tl.int64) * HV + i_hv) * KS * VS
                 if STATE_V_FIRST:
-                    p_ht = p_ht + o_v[:, None] * K + o_k[None, :]
+                    p_ht = p_ht + o_v[:, None] * KS + o_k[None, :]
                 else:
-                    p_ht = p_ht + o_k[:, None] * V + o_v[None, :]
+                    p_ht = p_ht + o_k[:, None] * VS + o_v[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -301,29 +318,58 @@ def fused_recurrent_kda_fwd_npu(
 
     if initial_state is not None and not initial_state.is_contiguous():
         raise ValueError("`initial_state` must be contiguous")
-    if out is None:
-        out = torch.zeros_like(v)
-    else:
-        assert out.shape == v.shape
-        if not out.is_contiguous():
+    BV = _get_bv(K, V)
+    KP, VP = npu_pad(K, BK), npu_pad(V, BV)
+    is_beta_headwise = beta.ndim == v.ndim
+    q = npu_pad_last_dim(q, KP)
+    k = npu_pad_last_dim(k, KP)
+    g = npu_pad_last_dim(g, KP)
+    v = npu_pad_last_dim(v, VP)
+    if is_beta_headwise:
+        beta = npu_pad_last_dim(beta, VP)
+    if dt_bias is not None and KP != K:
+        dt_bias = npu_pad_last_dim(dt_bias.reshape(HV, K), KP).reshape(-1)
+
+    user_out = out
+    if user_out is not None:
+        if user_out.shape != (B, T, HV, V):
+            raise ValueError("`out` must have the same shape as `v`")
+        if not user_out.is_contiguous():
             raise ValueError("`out` must be contiguous")
+    pad_out = user_out is None or VP != V
+    out = v.new_zeros(B, T, HV, VP) if pad_out else user_out
+    pad_state = (
+        not inplace_final_state
+        and ssm_state_indices is None
+    )
+    if pad_state:
+        KS, VS = npu_pad(K, BK), npu_pad(V, BV)
+    else:
+        KS, VS = K, V
+    h0 = initial_state
+    if pad_state and initial_state is not None:
+        if state_v_first:
+            h0 = initial_state.new_zeros(initial_state.shape[0], HV, VS, KS)
+            h0[..., :V, :K] = initial_state
+        else:
+            h0 = initial_state.new_zeros(initial_state.shape[0], HV, KS, VS)
+            h0[..., :K, :V] = initial_state
     if inplace_final_state:
         assert initial_state is not None
         final_state = initial_state
     elif output_final_state:
         if state_v_first:
-            final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+            final_state = q.new_zeros(N, HV, VS, KS, dtype=torch.float32)
         else:
-            final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+            final_state = q.new_zeros(N, HV, KS, VS, dtype=torch.float32)
     else:
         final_state = None
 
-    stride_init_state_token = initial_state.stride(0) if initial_state is not None else 1
+    stride_init_state_token = h0.stride(0) if h0 is not None else 1
     stride_final_state_token = final_state.stride(0) if final_state is not None else 1
 
     stride_indices_seq = 1 if ssm_state_indices is None else ssm_state_indices.stride(0)
 
-    BV = _get_bv(K, V)
     task_num = triton.cdiv(V, BV) * N * HV
 
     kernel_kwargs = dict(
@@ -335,7 +381,7 @@ def fused_recurrent_kda_fwd_npu(
         A_log=A_log,
         dt_bias=dt_bias,
         o=out,
-        h0=initial_state,
+        h0=h0,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
@@ -347,18 +393,23 @@ def fused_recurrent_kda_fwd_npu(
         HV=HV,
         K=K,
         V=V,
+        KS=KS,
+        VS=VS,
+        KP=KP,
+        VP=VP,
         BK=BK,
         BV=BV,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
-        IS_BETA_HEADWISE=beta.ndim == v.ndim,
+        IS_BETA_HEADWISE=is_beta_headwise,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         ALLOW_NEG_EIGVAL=allow_neg_eigval,
         STATE_V_FIRST=state_v_first,
+        MASK_LEFTOVER=npu_leftover_mask(K=K, BK=BK, V=V, BV=BV),
     )
     max_tasks = max_grid_axis_chunks(task_num, 1, max_grid=ASCEND_MAX_GRID_DIM)
     for task_off in range(0, task_num, max_tasks):
@@ -366,4 +417,11 @@ def fused_recurrent_kda_fwd_npu(
         kernel_kwargs["TASK_OFFSET"] = task_off
         fused_recurrent_kda_fwd_kernel_npu[(task_len,)](**kernel_kwargs)
 
+    if pad_out:
+        out = npu_unpad(out, V)
+        if user_out is not None:
+            user_out.copy_(out)
+            out = user_out
+    if output_final_state and pad_state:
+        final_state = npu_unpad(final_state, V, K) if state_v_first else npu_unpad(final_state, K, V)
     return out, final_state

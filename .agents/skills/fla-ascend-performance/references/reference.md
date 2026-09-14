@@ -48,16 +48,17 @@ After changing `mem_mult`/tiles, always re-check compile + numeric correctness.
 
 ## Common failures and fixes
 
-- **UB overflow**: fewer concurrent fp32 tiles; smaller BK/BV; split kernels; avoid accidental large broadcasts. Also check for a **runtime** `block_ptr` vs masked-DMA branch — both paths stay live; constexpr-split (see [cases.md § causal_conv1d](cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split)).
+- **UB overflow**: fewer concurrent fp32 tiles; smaller BK/BV; split kernels; avoid accidental large broadcasts. Also check for a **runtime** `block_ptr` vs masked-DMA branch — both paths stay live; constexpr-split (see [cases.md § causal_conv1d](cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split)). Leftover `tl.where` copies defeat `enable_ubuf_saving` — do not keep aligned packed tiles on that path ([last-dim-dma-pad.md](last-dim-dma-pad.md)).
 - **Grid limit**: host-split axes + offsets, **or** switch to 1D core-grid; Cube-bound → `num_aicore`, Vector-bound → `num_vectorcore` / `get_multiprocessor_count`. Do not only grow tiles.
 - **MTE `DDR address out of range`**: `make_block_ptr` block end past packed `B*T` rows (or `BT+W-1` halo). Masked tail DMA, or constexpr-split so bulk never overshoots.
+- **Wrong results only on unaligned K/V/T or varlen**: last-dim leftover DMA aliases the next row when stride is not a multiple of `max(tile, 32)`. Pad with `npu_pad` (partial tiles also need `n+32 <= padded`); `MASK_LEFTOVER`; `zeros` not `empty`; mask before `exp2`. See [last-dim-dma-pad.md](last-dim-dma-pad.md).
 - **Compile of `None` pointer arithmetic**: `if CONSTEXPR_FLAG or runtime:` still lowers the else. Nest the constexpr flag in its own `if`/`elif`.
 - **Varlen wrong only on long seqs**: after slicing `chunk_indices`, check for a second global `NT_OFFSET`; on core-grid paths, verify `chunk_offsets` → `(i_n, i_t)` against `cu_seqlens`.
 - **Wrong results only in multi-task core-grid loops**: rebind local base pointers each `task_id`; avoid in-place `ptr +=` across iterations.
 - **Occasional bf16 NaN**: mask before exp, fp32 accum, exp/exp2 scale, solve precision.
 - **`tl.dot` left operand clobbered (Ascend only)**: `tl.dot(lhs, rhs, …)` may mutate `lhs` in UB (CUDA does not). Any later read of that tile — second lhs, rhs, store, or arithmetic — can see corrupted data. Two fixes: **GM reload** between stages (e.g. `wy_fast` u→w on `b_A`) or **`tile + 0.0` before the first lhs dot** when multiple disposable copies are needed in tight sequence. Post-dot `+ 0.0` is invalid. Full per-kernel catalog: [cases.md § tl.dot lhs clobber](cases.md#tldot-lhs-clobber--repo-wide-case-catalog). Symptom: numeric mismatch vs Torch, no compile error. Tests: `test_gdn_kernels.py`, `test_solve_tril.py`.
 - **Correct but slower**: launch count (split inter/intra + host grid chunks), tiny tiles, full-size fp32 scratch, extra layout converts, unsynced fake baselines.
-- **Local pass, full gate NaN**: tail writeback, boundary masks, invalid exp regions, scratch init before read.
+- **Local pass, full gate NaN**: tail writeback, boundary masks, invalid exp regions, scratch init before read. On NPU leftover tiles: RMW of `empty` workspace (use `zeros`) and last-chunk spill into the next batch.
 - **Compile-variant explosion**: do not specialize on T; move feature flags to heuristics/constexpr.
 - **`num_warps` / `num_stages` on NPU**: unsupported by Ascend Triton — remove from launches/autotune; never use as an optimization knob.
 - **int32 chunk-address overflow**: `NT = cdiv(T, BT)` under `do_not_specialize` is int32; `(NT-1)*HV*K*V` wraps before `.to(tl.int64)` on long context (K=V=128, HV=64, BT=64 → T>131K). Same class without `do_not_specialize`: packed conv `i_t * BT` then `offset * D` (D=4096 → T>524K). Fix: `tl.cast(i_t, tl.int64)*BT`, `tl.cast(i_b, tl.int64)*T`, `tl.cast(NT-1, tl.int64)*DH_CS` — never post-multiply `.to(tl.int64)`, never `B.to(tl.int64)` on specialized args.
@@ -78,9 +79,10 @@ Paths relative to the `flash-linear-attention` repo root. Detailed case notes: [
 ### UB / tile / grid
 
 - `fla/utils/ascend_ub_manager.py` — `compute_row_tile_block_size`, `iter_axis_launch_chunks`
+- `fla/utils/_ascend_align.py` — `npu_pad` / `npu_unpad` / `npu_leftover_mask` (CANN 32-size leftover DMA) — [last-dim-dma-pad.md](last-dim-dma-pad.md)
 - `fla/ops/common/backends/triton_ascend/chunk_scaled_dot_kkt.py` — peak tile, BC, UB-safe BK
-- `fla/ops/common/backends/triton_ascend/chunk_delta_h.py` — fwd recurrence, V tiling, bwd `dhu` (see [cases.md](cases.md))
-- `fla/ops/common/backends/triton_ascend/chunk_o.py` — fwd fuse + bwd G_T_CONTIG (see [cases.md](cases.md))
+- `fla/ops/common/backends/triton_ascend/chunk_delta_h.py` — fwd recurrence, V tiling, bwd `dhu`, leftover KS/VS pad (see [cases.md](cases.md))
+- `fla/ops/common/backends/triton_ascend/chunk_o.py` — fwd fuse + bwd G_T_CONTIG, leftover VP pad / mask-before-exp2 (see [cases.md](cases.md))
 - `fla/ops/gated_delta_rule/backends/triton_ascend/wy_fast.py` — multi-stage bwd; **`tl.dot` lhs clobber** (GM reload + copy) — [cases.md](cases.md)
 - `fla/ops/kda/backends/triton_ascend/wy_fast.py` — KDA variant of wy_fast; same clobber patterns
 - `fla/ops/kda/backends/triton_ascend/chunk_intra.py` — inter solve fused; multi-copy block merge — [cases.md](cases.md)

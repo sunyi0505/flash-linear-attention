@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.utils import get_multiprocessor_count, input_guard
+from fla.utils import get_multiprocessor_count, input_guard, npu_leftover_mask, npu_pad, npu_pad_last_dim, npu_unpad
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_grid_limited_tile_size,
@@ -104,6 +104,7 @@ def _launch_local_cumsum_vector(
 ):
     bh_total = B * H
     ns = triton.cdiv(S, BS)
+    SP = npu_pad(S, BS)
     kernel_kwargs = dict(
         s=g_org,
         o=g,
@@ -112,7 +113,7 @@ def _launch_local_cumsum_vector(
         T=T,
         B=B,
         H=H,
-        S=S,
+        S=SP,
         BT=BT,
         BS=BS,
         REVERSE=reverse,
@@ -404,11 +405,21 @@ def chunk_local_cumsum_vector_npu(
         BS,
         max_grid=ASCEND_MAX_GRID_DIM,
     )
+    SP = npu_pad(S, BS)
+    mask_leftover = npu_leftover_mask(
+        T=T, BT=BT, K=S, BK=BS, varlen=cu_seqlens is not None,
+    )
+    g_org = npu_pad_last_dim(g, SP)
     # graph 模式下未覆盖行须为 0：kda_gate_bwd 对输出做全量归约，脏行会污染 dA/dbias
-    g_org, g = g, (torch.zeros_like if use_graph else torch.empty_like)(g, dtype=output_dtype or g.dtype)
+    # leftover / padded last-dim stores can RMW destination lanes.
+    out_dtype = output_dtype or g.dtype
+    if use_graph or mask_leftover or SP != S:
+        g_out = g_org.new_zeros(*g_org.shape[:-1], SP, dtype=out_dtype)
+    else:
+        g_out = g_org.new_empty(*g_org.shape[:-1], SP, dtype=out_dtype)
     _launch_local_cumsum_vector(
         g_org=g_org,
-        g=g,
+        g=g_out,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -421,7 +432,7 @@ def chunk_local_cumsum_vector_npu(
         NT=NT,
         reverse=reverse,
     )
-    return g
+    return npu_unpad(g_out, S)
 
 
 @input_guard
@@ -484,8 +495,16 @@ def chunk_global_cumsum_vector_npu(
         max_grid=ASCEND_MAX_GRID_DIM,
     )
     ns = triton.cdiv(S, BS)
-
-    z = torch.empty_like(s, dtype=output_dtype or s.dtype)
+    SP = npu_pad(S, BS)
+    mask_leftover = npu_leftover_mask(
+        T=T, BT=BT, K=S, BK=BS, varlen=cu_seqlens is not None,
+    )
+    s = npu_pad_last_dim(s, SP)
+    out_dtype = output_dtype or s.dtype
+    if mask_leftover or SP != S:
+        z = s.new_zeros(*s.shape[:-1], SP, dtype=out_dtype)
+    else:
+        z = s.new_empty(*s.shape[:-1], SP, dtype=out_dtype)
     bh_total = N * H
     kernel_kwargs = dict(
         s=s,
@@ -495,7 +514,7 @@ def chunk_global_cumsum_vector_npu(
         T=T,
         B=B,
         H=H,
-        S=S,
+        S=SP,
         BT=BT,
         BS=BS,
         REVERSE=reverse,
@@ -506,7 +525,7 @@ def chunk_global_cumsum_vector_npu(
         bh_len = min(max_bh, bh_total - bh_off)
         kernel_kwargs['BH_OFFSET'] = bh_off
         chunk_global_cumsum_vector_kernel_npu[(ns, bh_len)](**kernel_kwargs)
-    return z
+    return npu_unpad(z, S)
 
 
 @input_guard
