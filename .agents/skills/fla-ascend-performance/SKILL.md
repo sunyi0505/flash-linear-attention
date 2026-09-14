@@ -5,12 +5,14 @@ description: >
   Covers profiling with torch_npu, PipeUtilization/MemoryUB CSV analysis, Cube/Vector/MTE/UB
   bottleneck diagnosis, and kernel optimization (UB tiling, grid splits, fusion/split, varlen,
   G_T_CONTIG gate loading, constexpr DMA-path split / TAIL_MODE, extract_slice, MTE OOB,
-  int32 address overflow, tl.cast vs constexpr .to, make_block_ptr int32 offsets,
-  correctness gates, tl.dot left-operand clobber). NPU kernels must not use num_warps/num_stages.
+  last-dim leftover DMA padding / npu_pad / MASK_LEFTOVER, int32 address overflow,
+  tl.cast vs constexpr .to, make_block_ptr int32 offsets, correctness gates,
+  tl.dot left-operand clobber). NPU kernels must not use num_warps/num_stages.
   Per-kernel catalog: references/cases.md (incl. causal_conv1d core-grid).
   Use when working on NPU profiling, kernel_details/op_statistic, aic_metrics,
   fla triton_ascend backends (ops or modules), g transpose stride-1, UB overflow,
-  dual-path DCE, grid limits, int64 pointer math, tl.dot reuse, or Ascend performance.
+  unaligned K/V/T accuracy, leftover DMA aliasing, dual-path DCE, grid limits,
+  int64 pointer math, tl.dot reuse, or Ascend performance.
 ---
 
 # FLA Ascend NPU: Profiling → Bottlenecks → Optimization
@@ -130,11 +132,13 @@ Change only levers that match the bottleneck; one hypothesis per round. Before t
 - Use `fla.utils.ascend_ub_manager` (`compute_row_tile_block_size`, etc.); do not hard-code capacity; keep ~0.75–0.85 safety margin.
 - Prefer power-of-two tiles; matrix ops prefer 16-alignment; model fwd/bwd separately (bwd usually smaller tiles).
 - If a fused kernel cannot fit a reliable UB budget, split stages + scratch/recompute — do not keep an inevitably overflowing live set for “fusion”.
+- Leftover `tl.where` (partial last tile / varlen) copies live slabs and defeats `enable_ubuf_saving`. Do not over-admit aligned packed tiles (e.g. D256 BK=256/BV=128) on that path; count extra slab copies in the host peak model ([last-dim-dma-pad.md](references/last-dim-dma-pad.md)).
 - Persistently unused safe budget → consider non-PoT tiles / calibrate `mem_mult`; near 100% and still slow → look at pipe/bandwidth.
 
 ### Layout, grid, numerics
 
 - Innermost block-pointer dim should be contiguous; `tl.make_block_ptr` + `boundary_check`; `@input_guard` for layout — do not emulate arbitrary strides in-kernel.
+- **Last-dim leftover DMA pad (critical on Ascend)**: CANN leftover DMA of a tile is rounded to 32. If the last-dim stride is not a multiple of `max(tile, 32)`, leftover aliases the next row; a partial last tile also needs `n + 32 <= padded` (D=60, tile=64 → 128, not 64). Use `npu_pad` / `npu_unpad` / `npu_leftover_mask` from `fla.utils`; kernel strides use `KS`/`VS`/`KP`/`VP`. Zero leftover lanes when unaligned or varlen; allocate padded outputs with `zeros` (masked stores RMW `empty`); mask gate diffs **before** `exp2`. Leftover `tl.where` defeats `enable_ubuf_saving` — do not over-admit the aligned packed tiles on that path. Details: [last-dim-dma-pad.md](references/last-dim-dma-pad.md).
 - **Gate `g` along T (critical on Ascend)**: if `g` is `[B, T, HV]`, host `g.transpose(1, 2).contiguous()` and load via `G_T_CONTIG` + stride-1 `g_ptr` (see [g-contiguous-loading.md](references/g-contiguous-loading.md)). Stride-`HV` gathers in bwd hot loops can be **10×–35× slower** than contiguous loads; HV==1 needs no transpose. Match fwd pointer math; keep `T_seq` before varlen overwrites `T`.
 - Distinct shapes (e.g. `HV==1`, layout flags) get separate paths — no expensive hot-loop branches.
 - Grid product cap `ASCEND_MAX_GRID_DIM=65535`: host-split with `iter_axis_launch_chunks`, pass `*_OFFSET`; after varlen slicing, zero the matching offset — never slice and also add a global offset. UB and grid are independent constraints.
@@ -144,13 +148,13 @@ Change only levers that match the bottleneck; one hypothesis per round. Before t
 - **int64 before multiply on runtime indices**: program IDs and grid-derived values (`i_t`, `i_b`, `NT = cdiv(T, BT)`) are runtime int32 or narrower. `do_not_specialize` on `T` makes `NT` runtime, but `i_t * stride` also wraps when `T` is specialized (packed conv: `i_t * BT` then `offset * D`). `(NT - 1) * DH_CS` wraps past 2³¹ before a trailing `.to(tl.int64)`. Example: DH_CS=`HV*K*V`, K=V=128, HV=64, BT=64 → overflow at NT>2048 (T>131K). Packed `offset * D`: T>2³¹/D (D=4096 → T>524K). Cast the index first with `tl.cast` (not `.to` on specialized ints): `tl.cast(i_t, tl.int64) * BT`, `tl.cast(i_b, tl.int64) * T`, `tl.cast(B, tl.int64) * T`, `tl.cast(NT - 1, tl.int64) * DH_CS`. Kernel args `B`/`T` are constexpr — `B.to(tl.int64)` is `AttributeError("'constexpr' object has no attribute 'to'")`; `i_t`/`i_b` can fold to constexpr when NT=1. `tl.load(...).to(tl.int64)` on `cu_seqlens` is fine. Never `(i_b * T).to(tl.int64)` or `((NT - 1) * DH_CS).to(tl.int64)`.
 - **`make_block_ptr` offsets stay int32**: Triton rejects int64 `offsets/block_shape`. Flattened pointer math (`bos * D`, `t0 * D`, `i_b * stride`) uses int64; pass `i_t * BT` (int32) as the block row offset. Do not feed `t0` into `make_block_ptr`. Case: [causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
 - **Varlen `cu_seqlens` → int64 for pointer math**: host dtype is often `torch.long`, but tests also pass `int32`; load as `tl.int64` either way. Loading `.to(tl.int32)` then `(bos * HV + i_hv) * V` overflows well before `bos` hits 2³¹ (HV=32, V=4096 → safe `bos` ≈ 16K). Pattern: `bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64); T_cur = (eos - bos).to(tl.int32)`. Non-varlen: `bos = tl.cast(i_b, tl.int64) * T` (CUDA/repo often writes `(i_b * T).to(tl.int64)`, which still wraps if `i_b * T` exceeds 2³¹). Alternative when `T_cur` only needs int32: load `bos` as int32 but cast **the index** before the large stride — `tl.cast(bos, tl.int64) * HV + i_h` then `* K`. `(bos * HV + i_h).to(tl.int64) * K` only fixes `* K`/`* V` (HV is small); `bos * HV` itself can still wrap.
-- Reductions / recurrence / grads use fp32 accum, cast on store; sensitive solves: `input_precision='ieee'` / `allow_tf32=False`; mask before exp on gated paths; keep a consistent `exp`/`exp2` base.
+- Reductions / recurrence / grads use fp32 accum, cast on store; sensitive solves: `input_precision='ieee'` / `allow_tf32=False`; mask before exp on gated paths; keep a consistent `exp`/`exp2` base. On NPU leftover tiles, mask **then** `exp2` — leftover `g` loads as 0 and `exp2(0 - g_valid)` overflows to inf.
 - **Ascend `tl.dot` clobbers the left operand**: on NPU, `tl.dot(lhs, rhs, …)` may overwrite `lhs` in UB (CUDA Triton does not). Any later read of that tile (second lhs, rhs, store) sees corrupted data unless you reload from GM or copy with `tile + 0.0` **before** the first lhs dot. Full per-kernel catalog: [cases.md § tl.dot lhs clobber](references/cases.md#tldot-lhs-clobber--repo-wide-case-catalog). Symptom: silent numeric drift vs Torch oracle with no compile error.
 - **Audit checklist for new/changed kernels**: (1) `rg 'tl\.dot\(' fla/ops/**/triton_ascend/**` — only 8 op files use `tl.dot`; (2) for each lhs tile, flag lhs→lhs, lhs→rhs/store, or post-dot copy; (3) prefer GM reload for one reuse between stages, `+ 0.0` for tight multi-dot sequences; (4) re-run `tests/ops/test_gdn_kernels.py` + op-specific kernel tests.
 - **Upstream**: lhs clobber is a Triton-Ascend backend limitation (UB capacity / in-place matmul), not intentional API. Durable fix belongs in the compiler (preserve lhs or emit a diagnostic on post-dot read). Track via the Triton-Ascend / Ascend backend issue tracker.
 - For separable gate differences, compute `exp2(gs)[:, None] / exp2(gc)[None, :]` instead of `exp2(gs[:, None] - gc[None, :])` to replace a matrix of exponentials with two vectors. Verify numerics on the target compiler; multiplying by `exp2(-gc)` can produce materially different Ascend results.
 - **Constexpr-split mutually exclusive DMA paths** (critical on Ascend): a runtime `if is_tail_chunk` that chooses `make_block_ptr` vs masked `tl.load` keeps **both** paths live in UB. Peak UB ≈ sum of both; Vector cannot saturate even when MemoryUB bandwidth is free; larger tiles then fail compile. Host-split the last tile into a second launch with `tl.constexpr TAIL_MODE` (`0` = never tail / block_ptr only, `1` = always masked, `2` = runtime for varlen / `NT==1`) so each compile DCE's the unused path. Case: [causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
-- **MTE DMA past packed allocation**: `make_block_ptr` whose block end overshoots packed `B*T` rows faults MTE (`DDR address out of range`). Use masked load/store on the last chunk, or the constexpr split above so bulk never overshoots. Halo windows (`BT+W-1`) overshoot even sooner — count the halo in the tail predicate.
+- **MTE DMA past packed allocation**: `make_block_ptr` whose block end overshoots packed `B*T` rows faults MTE (`DDR address out of range`). Use masked load/store on the last chunk, or the constexpr split above so bulk never overshoots. Halo windows (`BT+W-1`) overshoot even sooner — count the halo in the tail predicate. Last-dim leftover (K/V not 32-aligned) is a different bug — silent row aliasing, not an MTE fault; pad with `npu_pad` ([last-dim-dma-pad.md](references/last-dim-dma-pad.md)).
 - **Do not OR a constexpr optional-pointer flag with a runtime check**: `if USE_INITIAL_STATE or i_t*BT < W` still lowers the else and compiles `initial_state + …` when the pointer is `None`. Nest: `if not FLAG: … elif runtime: … else: …`.
 - **`tl.extract_slice` / `tl.insert_slice`**: sliding-window taps without extra GM loads (causal conv). Some triton-ascend versions expose them only via `triton.language.extra.cann.extension` — shim onto `tl` if missing. Preloading every tap tile overflows UB; load inside the `static_range` or one `BT+W-1` window + slice.
 - **Weight `[D, W]` → host `transpose(0,1).contiguous()` to `[W, D]`** for stride-1 channel `block_ptr` (same idea as G_T_CONTIG). Odd `D` that cannot be tiled with a power-of-two `BD` that divides `D` and `BD>=16` falls back to the legacy multi-axis path.
@@ -172,7 +176,7 @@ Failure modes and repo paths: [reference.md](references/reference.md). Detailed 
 Each round, in order:
 
 1. Single kernel vs Torch oracle (fp16/bf16, fwd+bwd).
-2. Shape matrix: small/large T, non-aligned tiles, head sharing, gate/state, fixed/varlen.
+2. Shape matrix: small/large T, non-aligned tiles (K/V not 32-aligned, leftover T), head sharing, gate/state, fixed/varlen.
 3. End-to-end tests; confirm dispatch hits `triton_ascend`.
 4. Frozen full pytest gate (incl. NaN poisoning); on failure, stop — do not claim speedups.
 5. Synchronized benchmark (latency/throughput, fwd and fwd+bwd); re-profile with the same `aic_metrics` and confirm Duration/pipe/UB move as expected.
@@ -203,6 +207,7 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - [ ] Runtime `block_ptr` vs masked DMA: constexpr-split so bulk DCE's the unused path; tail DMA does not overshoot packed `B*T` (include halo)
 - [ ] Optional-pointer constexpr flags are nested, not `or`-ed with runtime checks (None ptr must not compile)
 - [ ] Block pointers contiguous innermost; **gate `g` uses G_T_CONTIG** when `[B,T,HV]` (see [g-contiguous-loading.md](references/g-contiguous-loading.md)); tail `boundary_check`
+- [ ] Last-dim K/V (and leftover T / varlen): `npu_pad` so leftover DMA cannot alias the next row; `MASK_LEFTOVER` zeros padding lanes; padded workspace is `zeros` not `empty`; unpad before return ([last-dim-dma-pad.md](references/last-dim-dma-pad.md))
 - [ ] fp32 accum consistent with output/exp base; fusion worth the complexity (no gratuitous `ACCUMULATE_OUTPUT` writeback when UB allows)
 - [ ] Reused `tl.dot` left-hand tiles: GM reload or `tile + 0.0` **before** first lhs dot (post-dot copy invalid); see [cases.md § tl.dot catalog](references/cases.md#tldot-lhs-clobber--repo-wide-case-catalog)
 - [ ] fwd/bwd/varlen/layout branches covered; no unwritten regions under NaN poisoning
@@ -227,6 +232,9 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - `if CONSTEXPR_FLAG or runtime:` around an optional pointer — else still compiles when the ptr is None
 - `B.to(tl.int64)` / `i_t.to(tl.int64)` on specialized or folded constexpr ints (`constexpr` has no `.to`); use `tl.cast`
 - Passing int64 `t0` as `make_block_ptr` offsets (`offsets/block_shape` must be int32)
+- Last-dim stride = logical `K`/`V` when `n % 32 != 0` (leftover DMA aliases the next row); `cdiv(n, tile)*tile` without the `n+32` bump (D=60/tile=64 must pad to 128)
+- `torch.empty` for leftover / padded NPU outputs (masked stores RMW NaN / next-batch tokens)
+- `exp2(g_i - g_j)` then causal-mask on leftover T (padding `g=0` overflows to inf)
 
 ## Related files
 
@@ -234,6 +242,7 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - Metrics, failure modes, code index: [references/reference.md](references/reference.md)
 - Past kernel case notes: [references/cases.md](references/cases.md)
 - **Gate `g` stride-1 loading (G_T_CONTIG)**: [g-contiguous-loading.md](references/g-contiguous-loading.md)
+- **Last-dim leftover DMA padding (`npu_pad` / `MASK_LEFTOVER`)**: [last-dim-dma-pad.md](references/last-dim-dma-pad.md)
 - **causal_conv1d 1D core-grid + constexpr DMA split**: [cases.md § causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split)
-- Ascend-specific traps (DMA dual-path UB, None-ptr compile, `constexpr` `.to`, int64 `block_ptr` offsets): [TRAPS.md](references/TRAPS.md)
+- Ascend-specific traps (DMA dual-path UB, leftover last-dim aliasing, None-ptr compile, `constexpr` `.to`, int64 `block_ptr` offsets): [TRAPS.md](references/TRAPS.md)
 - Ad-hoc workload output dir: `npu_prof/` (new collection must use the generic scripts)
