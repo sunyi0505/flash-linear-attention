@@ -10,6 +10,7 @@ import os
 _worker = os.environ.get("PYTEST_XDIST_WORKER")
 if os.environ.get("FLA_NPU_XDIST") == "1" and _worker and _worker.startswith("gw"):
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = _worker[2:]
+    os.environ["TRITON_CACHE_DIR"] = f"/tmp/triton-{_worker}"
 
 import inspect
 from unittest.mock import patch

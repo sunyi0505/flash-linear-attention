@@ -15,7 +15,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
-from fla.utils import ascend_compile_kwargs, input_guard
+from fla.utils import ascend_compile_kwargs, input_guard, npu_pad, npu_unpad
 from fla.utils.ascend_ub_manager import (
     compute_row_tile_block_size,
     get_npu_properties,
@@ -349,7 +349,7 @@ _FWD_O_BV = 128
 @triton.jit(do_not_specialize=['T', 'total_chunks', 'task_num', 'num_core'])
 def chunk_gla_fwd_kernel_o_npu(
     q, v, g, h, o, A, cu_seqlens, chunk_indices, scale, T,
-    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, VP: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     total_chunks, task_num, num_core,
     STATE_V_FIRST: tl.constexpr, IS_VARLEN: tl.constexpr,
@@ -381,7 +381,7 @@ def chunk_gla_fwd_kernel_o_npu(
         q_ptr = q + (bos * H + i_h) * K
         g_ptr = g + (bos * HV + i_hv) * K
         v_ptr = v + (bos * HV + i_hv) * V
-        o_ptr = o + (bos * HV + i_hv) * V
+        o_ptr = o + (bos * HV + i_hv) * VP
         h_base = h + (i_tg * HV + i_hv) * K * V
         a_ptr = A + (bos * HV + i_hv) * BT
 
@@ -408,7 +408,7 @@ def chunk_gla_fwd_kernel_o_npu(
         m_t = o_t < T_cur
         p_a = tl.make_block_ptr(a_ptr, (T_cur, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
         p_v = tl.make_block_ptr(v_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_o = tl.make_block_ptr(o_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_o = tl.make_block_ptr(o_ptr, (T_cur, VP), (HV * VP, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_A = tl.load(p_a, boundary_check=(0, 1))
         m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
         b_A = tl.where(m_s & (m_t[:, None] & m_t[None, :]), b_A, 0.0)
@@ -443,8 +443,9 @@ def chunk_gla_fwd_o_gk_npu(
     else:
         total_chunks = len(chunk_indices)
 
-    o = torch.zeros_like(v)
     BV = min(_FWD_O_BV, triton.next_power_of_2(V))
+    VP = npu_pad(V, BV)
+    o = v.new_zeros(B, T, HV, VP)
     NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()['num_aicore']
     task_num = NV * HV * total_chunks
@@ -463,6 +464,7 @@ def chunk_gla_fwd_o_gk_npu(
         HV=HV,
         K=K,
         V=V,
+        VP=VP,
         BT=BT,
         BV=BV,
         total_chunks=total_chunks,
@@ -471,7 +473,7 @@ def chunk_gla_fwd_o_gk_npu(
         STATE_V_FIRST=state_v_first,
         IS_VARLEN=cu_seqlens is not None,
     )
-    return o
+    return npu_unpad(o, V)
 
 
 def _bwd_pick_bk(K: int) -> int:
@@ -570,7 +572,7 @@ def chunk_gla_bwd_dA_npu(
 @triton.jit(do_not_specialize=['T', 'A_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_gla_bwd_kernel_dv_npu(
     k, g, A, do, dh, dv, cu_seqlens, chunk_indices, T,
-    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, VP: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     IS_VARLEN: tl.constexpr, STATE_V_FIRST: tl.constexpr,
     A_OFFSET, NT_OFFSET, BH_OFFSET,
@@ -643,7 +645,7 @@ def chunk_gla_bwd_kernel_dv_npu(
         b_dv = tl.dot(b_k, b_dh, b_dv, allow_tf32=False)
 
     tl.store(
-        dv + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :],
+        dv + (bos * H + i_h) * VP + o_t[:, None] * (H * VP) + o_v[None, :],
         b_dv.to(dv.dtype.element_ty), mask=m_tv,
     )
 
@@ -666,7 +668,8 @@ def chunk_gla_bwd_dv_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
-    dv = torch.zeros_like(do)
+    VP = npu_pad(V, BV)
+    dv = do.new_zeros(B, T, H, VP)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dv_npu,
         (triton.cdiv(V, BV), NT, B * H),
@@ -674,18 +677,18 @@ def chunk_gla_bwd_dv_npu(
         kernel_kwargs=dict(
             k=k, g=g, A=A, do=do, dh=dh, dv=dv,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T,
-            H=H, K=K, V=V, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
+            H=H, K=K, V=V, VP=VP, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
-    return dv
+    return npu_unpad(dv, V)
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
 @triton.jit(do_not_specialize=['T', 'A_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_gla_bwd_kernel_intra_npu(
     q, k, g, dA, dq, dk, cu_seqlens, chunk_indices, T,
-    H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
+    H: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
     IS_VARLEN: tl.constexpr, A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
     i_kc = tl.program_id(0) + A_OFFSET
@@ -757,7 +760,7 @@ def chunk_gla_bwd_kernel_intra_npu(
         b_dq += tl.where(m_i & active, b_dAj[:, None] * b_kj[None, :] * exp2(b_g - b_gkj[None, :]), 0.)
 
     tl.store(
-        dq + (bos * H + i_h) * K + o_c[:, None] * (H * K) + o_k[None, :],
+        dq + (bos * H + i_h) * KP + o_c[:, None] * (H * KP) + o_k[None, :],
         b_dq.to(dq.dtype.element_ty), mask=m_ck,
     )
 
@@ -805,7 +808,7 @@ def chunk_gla_bwd_kernel_intra_npu(
         b_dk += tl.where(m_i & active, b_dAj[:, None] * b_qj[None, :] * exp2(b_gqj[None, :] - b_g), 0.)
 
     tl.store(
-        dk + (bos * H + i_h) * K + o_c[:, None] * (H * K) + o_k[None, :],
+        dk + (bos * H + i_h) * KP + o_c[:, None] * (H * KP) + o_k[None, :],
         b_dk.to(dk.dtype.element_ty), mask=m_ck,
     )
 
@@ -829,8 +832,9 @@ def chunk_gla_bwd_dqk_intra_npu(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
-    dq = torch.zeros_like(q, dtype=torch.float)
-    dk = torch.zeros_like(k, dtype=torch.float)
+    KP = npu_pad(K, BK)
+    dq = q.new_zeros(B, T, H, KP, dtype=torch.float)
+    dk = k.new_zeros(B, T, H, KP, dtype=torch.float)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_intra_npu,
         (NK * NC, NT, B * H),
@@ -838,11 +842,11 @@ def chunk_gla_bwd_dqk_intra_npu(
         kernel_kwargs=dict(
             q=q, k=k, g=g, dA=dA, dq=dq, dk=dk,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T,
-            H=H, K=K, BT=BT, BC=BC, BK=BK, NC=NC,
+            H=H, K=K, KP=KP, BT=BT, BC=BC, BK=BK, NC=NC,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
-    return dq, dk
+    return npu_unpad(dq, K), npu_unpad(dk, K)
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
@@ -850,7 +854,7 @@ def chunk_gla_bwd_dqk_intra_npu(
 def chunk_gla_bwd_kernel_inter_npu(
     q, k, v, g, h, do, dh, dq, dk, dq2, dk2, dg,
     cu_seqlens, chunk_indices, scale, T,
-    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    H: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     IS_VARLEN: tl.constexpr, STATE_V_FIRST: tl.constexpr,
     A_OFFSET, NT_OFFSET, BH_OFFSET,
@@ -889,9 +893,9 @@ def chunk_gla_bwd_kernel_inter_npu(
     dh_base = dh + (i_tg * H + i_h) * K * V
     dq_base = dq + (bos * H + i_h) * K
     dk_base = dk + (bos * H + i_h) * K
-    dq2_base = dq2 + (bos * H + i_h) * K
-    dk2_base = dk2 + (bos * H + i_h) * K
-    dg_base = dg + (bos * H + i_h) * K
+    dq2_base = dq2 + (bos * H + i_h) * KP
+    dk2_base = dk2 + (bos * H + i_h) * KP
+    dg_base = dg + (bos * H + i_h) * KP
 
     b_gk = tl.load(g_base + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0).to(tl.float32)
     b_gn = tl.load(g_base + (min(T, i_t * BT + BT) - 1) * H * K + o_k, mask=m_k, other=0).to(tl.float32)
@@ -927,9 +931,9 @@ def chunk_gla_bwd_kernel_inter_npu(
     b_dk += tl.load(dk_base + o_t[:, None] * (H * K) + o_k[None, :], mask=m_tk, other=0.0).to(tl.float32)
     b_dg = b_q * b_dq - b_k * b_dk
     b_dg = b_dg - tl.cumsum(b_dg, axis=0) + tl.sum(b_dg, axis=0)[None, :] + b_dgk[None, :]
-    tl.store(dq2_base + o_t[:, None] * (H * K) + o_k[None, :], b_dq.to(dq2.dtype.element_ty), mask=m_tk)
-    tl.store(dk2_base + o_t[:, None] * (H * K) + o_k[None, :], b_dk.to(dk2.dtype.element_ty), mask=m_tk)
-    tl.store(dg_base + o_t[:, None] * (H * K) + o_k[None, :], b_dg.to(dg.dtype.element_ty), mask=m_tk)
+    tl.store(dq2_base + o_t[:, None] * (H * KP) + o_k[None, :], b_dq.to(dq2.dtype.element_ty), mask=m_tk)
+    tl.store(dk2_base + o_t[:, None] * (H * KP) + o_k[None, :], b_dk.to(dk2.dtype.element_ty), mask=m_tk)
+    tl.store(dg_base + o_t[:, None] * (H * KP) + o_k[None, :], b_dg.to(dg.dtype.element_ty), mask=m_tk)
 
 
 @input_guard
@@ -955,9 +959,10 @@ def chunk_gla_bwd_dqkg_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
-    dg = torch.zeros_like(g)
-    dq2 = torch.zeros_like(dq)
-    dk2 = torch.zeros_like(dk)
+    KP = npu_pad(K, BK)
+    dg = g.new_zeros(B, T, H, KP)
+    dq2 = dq.new_zeros(B, T, H, KP)
+    dk2 = dk.new_zeros(B, T, H, KP)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_inter_npu,
         (triton.cdiv(K, BK), NT, B * H),
@@ -966,9 +971,9 @@ def chunk_gla_bwd_dqkg_npu(
             q=q, k=k, v=v, g=g, h=h, do=do, dh=dh, dq=dq, dk=dk,
             dq2=dq2, dk2=dk2, dg=dg,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, scale=scale, T=T,
-            H=H, K=K, V=V, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
+            H=H, K=K, KP=KP, V=V, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
         compile_kwargs=_GLA_COMPILE_KWARGS,
     )
-    return dq2, dk2, dg
+    return npu_unpad(dq2, K), npu_unpad(dk2, K), npu_unpad(dg, K)

@@ -16,7 +16,7 @@ import triton.runtime.driver as driver
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
-from fla.utils import input_guard
+from fla.utils import input_guard, npu_pad, npu_unpad
 from fla.utils.ascend_ub_manager import compute_row_tile_block_size
 
 # recompute_w_u_fwd: peak UB is max(u-slab, w-slab), not sum — tile BK/BV independently.
@@ -133,6 +133,8 @@ def recompute_w_u_fwd_kda_kernel_npu(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    KP: tl.constexpr,
+    VP: tl.constexpr,
     STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -167,10 +169,10 @@ def recompute_w_u_fwd_kda_kernel_npu(
 
         k_ptr = k + (bos * H + i_h) * K
         v_ptr = v + (bos * HV + i_hv) * V
-        u_ptr = u + (bos * HV + i_hv) * V
-        w_ptr = w + (bos * HV + i_hv) * K
+        u_ptr = u + (bos * HV + i_hv) * VP
+        w_ptr = w + (bos * HV + i_hv) * KP
         A_ptr = A + (bos * HV + i_hv) * BT
-        kg_ptr = kg + (bos * HV + i_hv) * K
+        kg_ptr = kg + (bos * HV + i_hv) * KP
         if BETA_T_CONTIG:
             beta_ptr = beta + beta_bh
         else:
@@ -181,7 +183,7 @@ def recompute_w_u_fwd_kda_kernel_npu(
             gk_ptr = gk + (bos * HV + i_hv) * K
         if STORE_QG:
             q_ptr = q + (bos * H + i_h) * K
-            qg_ptr = qg + (bos * HV + i_hv) * K
+            qg_ptr = qg + (bos * HV + i_hv) * KP
 
         p_b = _beta_block_ptr(beta_ptr, T, i_t, BT, BETA_T_CONTIG, HV)
         b_b = tl.load(p_b, boundary_check=(0,))
@@ -192,7 +194,7 @@ def recompute_w_u_fwd_kda_kernel_npu(
 
         for i_v in range(tl.cdiv(V, BV)):
             p_v = tl.make_block_ptr(v_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_u = tl.make_block_ptr(u_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_u = tl.make_block_ptr(u_ptr, (T, VP), (HV * VP, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             b_v = tl.load(p_v, boundary_check=(0, 1))
             b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
             # Ascend tl.dot may clobber the left operand; reload A each V tile.
@@ -212,7 +214,7 @@ def recompute_w_u_fwd_kda_kernel_npu(
 
             if STORE_QG:
                 p_q = tl.make_block_ptr(q_ptr, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                p_qg = tl.make_block_ptr(qg_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                p_qg = tl.make_block_ptr(qg_ptr, (T, KP), (HV * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                 b_q = tl.load(p_q, boundary_check=(0, 1))
                 tl.store(p_qg, (b_q * b_gk_exp).to(p_qg.dtype.element_ty), boundary_check=(0, 1))
 
@@ -224,13 +226,13 @@ def recompute_w_u_fwd_kda_kernel_npu(
                 else:
                     b_gn = tl.load(gk_ptr + last_idx * HV * K + o_k, mask=m_k, other=0.0).to(tl.float32)
                 b_kg = b_k * exp2(b_gn[None, :] - b_gk)
-                p_kg = tl.make_block_ptr(kg_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                p_kg = tl.make_block_ptr(kg_ptr, (T, KP), (HV * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
                 tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 
             # Ascend tl.dot may clobber the left operand; reload A each K tile.
             b_A = tl.load(p_A, boundary_check=(0, 1))
             b_w = tl.dot(b_A, b_kb.to(b_k.dtype), allow_tf32=False)
-            p_w = tl.make_block_ptr(w_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+            p_w = tl.make_block_ptr(w_ptr, (T, KP), (HV * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
             tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -261,10 +263,11 @@ def recompute_w_u_fwd_kda_npu(
     beta, beta_t_contig = _hv_t_npu_arg(beta, HV)
     gk, gk_t_contig = _hv_t_npu_arg(gk, HV)
 
-    w = k.new_empty(B, T, HV, K)
-    u = torch.empty_like(v)
-    qg = k.new_empty(B, T, HV, K) if store_qg else None
-    kg = k.new_empty(B, T, HV, K)
+    KP, VP = npu_pad(K, BK), npu_pad(V, BV)
+    w = k.new_zeros(B, T, HV, KP)
+    u = v.new_zeros(B, T, HV, VP)
+    qg = k.new_zeros(B, T, HV, KP) if store_qg else None
+    kg = k.new_zeros(B, T, HV, KP)
 
     _launch_wy_core_grid(
         recompute_w_u_fwd_kda_kernel_npu,
@@ -291,8 +294,10 @@ def recompute_w_u_fwd_kda_npu(
             BT=BT,
             BK=BK,
             BV=BV,
+            KP=KP,
+            VP=VP,
             BETA_T_CONTIG=beta_t_contig,
             GK_T_CONTIG=gk_t_contig,
         ),
     )
-    return w, u, qg, kg
+    return npu_unpad(w, K), npu_unpad(u, V), npu_unpad(qg, K), npu_unpad(kg, K)
