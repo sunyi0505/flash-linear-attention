@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 import triton.runtime.driver as driver
 
-from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
+from fla.ops.utils import npu_leftover_mask, npu_pad_state_h, npu_unpad, prepare_chunk_indices, prepare_chunk_offsets, npu_pad
 from fla.ops.utils.op import exp2
 from fla.utils import input_guard
 from fla.utils.ascend_ub_manager import (
@@ -718,6 +718,7 @@ def chunk_bwd_kernel_dqkwg_npu(
     chunk_indices,
     scale,
     T,
+    T_STRIDE: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -748,10 +749,12 @@ def chunk_bwd_kernel_dqkwg_npu(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
+        bos_out = bos
     else:
         NT = tl.cdiv(T, BT)
         i_tg = tl.cast(i_b, tl.int64) * NT + i_t
         bos = tl.cast(i_b, tl.int64) * T
+        bos_out = tl.cast(i_b, tl.int64) * T_STRIDE
 
     v += (bos * HV + i_h) * V
     do += (bos * HV + i_h) * V
@@ -759,13 +762,13 @@ def chunk_bwd_kernel_dqkwg_npu(
     dh += (tl.cast(i_tg, tl.int64) * HV + i_h) * K * V
     q += (bos * H + i_h // (HV // H)) * K
     k += (bos * H + i_h // (HV // H)) * K
-    dq += (bos * HV + i_h) * K
-    dk += (bos * HV + i_h) * K
-    dq_f32 += (bos * HV + i_h) * K
-    dk_f32 += (bos * HV + i_h) * K
+    dq += (bos_out * HV + i_h) * KP
+    dk += (bos_out * HV + i_h) * KP
+    dq_f32 += (bos_out * HV + i_h) * KP
+    dk_f32 += (bos_out * HV + i_h) * KP
 
     if USE_DW:
-        dw += (bos * HV + i_h) * K
+        dw += (bos_out * HV + i_h) * KP
         dv += (bos * HV + i_h) * V
 
     if USE_G:
@@ -1169,6 +1172,7 @@ def chunk_bwd_kernel_dg_npu(
     chunk_indices,
     B: tl.constexpr,
     T,
+    T_STRIDE: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -1197,18 +1201,20 @@ def chunk_bwd_kernel_dg_npu(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
+        bos_out = bos
     else:
         NT = tl.cdiv(T, BT)
         i_tg = tl.cast(i_b, tl.int64) * NT + i_t
         bos = tl.cast(i_b, tl.int64) * T
+        bos_out = tl.cast(i_b, tl.int64) * T_STRIDE
 
     v += (bos * HV + i_h) * V
     h += (tl.cast(i_tg, tl.int64) * HV + i_h) * K * V
     dh += (tl.cast(i_tg, tl.int64) * HV + i_h) * K * V
     q += (bos * H + i_h // (HV // H)) * K
     k += (bos * H + i_h // (HV // H)) * K
-    dq_f32 += (bos * HV + i_h) * K
-    dk_f32 += (bos * HV + i_h) * K
+    dq_f32 += (bos_out * HV + i_h) * KP
+    dk_f32 += (bos_out * HV + i_h) * KP
     dg += i_k * n_tokens * HV
     dg += bos * HV + i_h
     if G_T_CONTIG:
@@ -1390,10 +1396,18 @@ def chunk_bwd_dqkwg_npu(
         scale = K ** -0.5
 
     use_dw = w is not None
+    leftover_t = cu_seqlens is None and (T % BT != 0)
+    T_stride = triton.cdiv(T, BT) * BT if cu_seqlens is None else T
     # Ungated full-BT hits Triton-Ascend `tl.trans` cc→cc copy on Cube-resident
     # ds[BT,BT]. Gated paths flush ds via exp2 (vector) and compile cleanly.
+    # Leftover T uses the BC path: full-BT masked dq/dk stores RMW into the next
+    # batch when the last chunk is partial (e.g. T=500, BT=64, B=2).
     full_tiles = _get_dqkwg_full_tiles(BT, K, V, use_dw)
-    use_full = full_tiles is not None and (g is not None or g_gamma is not None)
+    use_full = (
+        full_tiles is not None
+        and (g is not None or g_gamma is not None)
+        and not leftover_t
+    )
     if use_full:
         BK, BV = full_tiles
         dqkwg_kernel = chunk_bwd_kernel_dqkwg_full_npu
@@ -1402,18 +1416,44 @@ def chunk_bwd_dqkwg_npu(
         BK = _get_bk(K, BC)
         BV = _get_bv(V, BC)
         dqkwg_kernel = chunk_bwd_kernel_dqkwg_npu
-        dq_f32 = torch.empty(B, T, HV, K, dtype=torch.float32, device=q.device)
-        dk_f32 = torch.empty(B, T, HV, K, dtype=torch.float32, device=q.device)
+    KP = npu_pad(K, BK)
+    state_bk, state_bv = BK, BV
+    if g is not None and use_full:
+        hdh_bk, hdh_bv = _get_hdh_tiles(K, V)
+        state_bk, state_bv = max(BK, hdh_bk), max(BV, hdh_bv)
+    else:
+        hdh_bk = hdh_bv = None
+    KS, VS = npu_pad(K, state_bk), npu_pad(V, state_bv)
+    h = npu_pad_state_h(h, K, V, KS, VS, state_v_first)
+    dh = npu_pad_state_h(dh, K, V, KS, VS, state_v_first)
+    mask_leftover = npu_leftover_mask(
+        T=T, BT=BT, K=K, BK=BK, V=V, BV=BV, varlen=cu_seqlens is not None,
+    )
+    pad_t = T_stride != T
+    if not use_full:
+        if mask_leftover or KP != K or pad_t:
+            dq_f32 = torch.zeros(B, T_stride, HV, KP, dtype=torch.float32, device=q.device)
+            dk_f32 = torch.zeros(B, T_stride, HV, KP, dtype=torch.float32, device=q.device)
+        else:
+            dq_f32 = torch.empty(B, T_stride, HV, KP, dtype=torch.float32, device=q.device)
+            dk_f32 = torch.empty(B, T_stride, HV, KP, dtype=torch.float32, device=q.device)
     NK = triton.cdiv(K, BK)
     if g is not None:
         g_arg, g_t_contig = _g_npu_arg(g, HV)
     else:
         g_arg = q
         g_t_contig = False
-    dq = q.new_empty(B, T, HV, K)
-    dk = k.new_empty(B, T, HV, K)
-    dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
-    dw = torch.empty_like(w) if use_dw else None
+    # zeros: Triton-Ascend boundary_check stores can RMW destination lanes, so
+    # leftover-T padding of one batch's last chunk spills into the next batch.
+    if mask_leftover or KP != K or pad_t:
+        dq = q.new_zeros(B, T_stride, HV, KP)
+        dk = k.new_zeros(B, T_stride, HV, KP)
+        dw = w.new_zeros(B, T_stride, HV, KP) if use_dw else None
+    else:
+        dq = q.new_empty(B, T_stride, HV, KP)
+        dk = k.new_empty(B, T_stride, HV, KP)
+        dw = w.new_empty(B, T_stride, HV, KP) if use_dw else None
+    dg = torch.zeros(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
 
     dqkwg_kwargs = {
         'q': q,
@@ -1446,6 +1486,8 @@ def chunk_bwd_dqkwg_npu(
         'STATE_V_FIRST': state_v_first,
         'IS_VARLEN': cu_seqlens is not None,
     }
+    if not use_full:
+        dqkwg_kwargs['T_STRIDE'] = T_stride
     if use_full:
         dqkwg_kwargs['dg'] = dg if dg is not None else dq
         dqkwg_kwargs['B'] = B
@@ -1488,6 +1530,7 @@ def chunk_bwd_dqkwg_npu(
                 'chunk_indices': chunk_indices,
                 'B': B,
                 'T': T,
+                'T_STRIDE': T_stride,
                 'H': H,
                 'HV': HV,
                 'K': K,
@@ -1505,6 +1548,14 @@ def chunk_bwd_dqkwg_npu(
             },
         )
 
+    if pad_t:
+        dq = dq[:, :T].contiguous()
+        dk = dk[:, :T].contiguous()
+        if dw is not None:
+            dw = dw[:, :T].contiguous()
+    dq = npu_unpad(dq, K)
+    dk = npu_unpad(dk, K)
+    dw = npu_unpad(dw, K)
     if H != HV:
         dq = dq.view(B, T, H, HV // H, K).sum(3)
         dk = dk.view(B, T, H, HV // H, K).sum(3)
