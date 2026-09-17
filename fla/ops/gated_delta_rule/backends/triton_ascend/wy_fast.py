@@ -83,14 +83,14 @@ def _candidate_fwd_tiles(dim: int) -> list[int]:
 
 
 @triton.jit
-def _g_contig_base(g, bos, i_b, i_h, T_seq, HV, IS_VARLEN: tl.constexpr):
+def _g_contig_base(g, bos, i_b, i_h, T_seq, HV, IS_VARLEN):
     if IS_VARLEN:
         return g + bos + i_h * T_seq
     return g + tl.cast(i_b, tl.int64) * HV * T_seq + i_h * T_seq
 
 
 @triton.jit
-def _t_block_ptr(base, T, offset, BLK, CONTIG: tl.constexpr, HV: tl.constexpr):
+def _t_block_ptr(base, T, offset, BLK, CONTIG: tl.constexpr, HV):
     if CONTIG:
         return tl.make_block_ptr(base, (T,), (1,), (offset,), (BLK,), (0,))
     return tl.make_block_ptr(base, (T,), (HV,), (offset,), (BLK,), (0,))
@@ -124,7 +124,7 @@ def _launch_wy_core_grid(kernel, *, task_num: int, kernel_kwargs: dict) -> None:
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     "USE_G": lambda args: args["g"] is not None,
 })
-@triton.jit(do_not_specialize=["T", "B", "task_num", "num_core"])
+@triton.jit(do_not_specialize=["T", "B", "task_num", "num_core", "H", "HV"])
 def recompute_w_u_fwd_kernel_npu(
     k,
     v,
@@ -139,8 +139,8 @@ def recompute_w_u_fwd_kernel_npu(
     B,
     task_num,
     num_core,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -222,12 +222,12 @@ def recompute_w_u_fwd_kernel_npu(
 @triton.heuristics({
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-@triton.jit(do_not_specialize=["T", "B", "task_num", "num_core"])
+@triton.jit(do_not_specialize=["T", "B", "task_num", "num_core", "H", "HV"])
 def prepare_wy_repr_bwd_kv_npu(
     k, v, beta, g, A, dw, du, dk, dv, dA_scr, db, dg,
     cu_seqlens, chunk_indices, T, B,
     task_num, num_core,
-    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    H, HV, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     USE_G: tl.constexpr, IS_VARLEN: tl.constexpr,
     G_T_CONTIG: tl.constexpr, BETA_T_CONTIG: tl.constexpr,
@@ -364,7 +364,7 @@ def prepare_wy_repr_bwd_kv_npu(
 def prepare_wy_repr_bwd_da_mask_dot1_npu(
     A, dA_scr, dA_mid,
     cu_seqlens, chunk_indices, T,
-    HV: tl.constexpr, BT: tl.constexpr,
+    HV, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
 ):
@@ -406,7 +406,7 @@ def prepare_wy_repr_bwd_da_mask_dot1_npu(
 def prepare_wy_repr_bwd_da_dot2_npu(
     A, dA_mid, dA_out,
     cu_seqlens, chunk_indices, T,
-    HV: tl.constexpr, BT: tl.constexpr,
+    HV, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
 ):
@@ -438,7 +438,7 @@ def prepare_wy_repr_bwd_da_dot2_npu(
 def prepare_wy_repr_bwd_da_gate_npu(
     g, dA_out,
     cu_seqlens, chunk_indices, T,
-    HV: tl.constexpr, BT: tl.constexpr,
+    HV, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr, G_T_CONTIG: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
 ):
@@ -480,7 +480,7 @@ def prepare_wy_repr_bwd_finalize_k_npu(
     k, beta, dA_out, dk, db,
     cu_seqlens, chunk_indices, T, B,
     task_num, num_core,
-    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
+    H, HV, K: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr, BETA_T_CONTIG: tl.constexpr, DB_T_CONTIG: tl.constexpr,
 ):
@@ -545,7 +545,7 @@ def prepare_wy_repr_bwd_finalize_k_npu(
 def prepare_wy_repr_bwd_finalize_a2_dg_npu(
     k, beta, dA_out, dg,
     cu_seqlens, chunk_indices, T,
-    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
+    H, HV, K: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr, BETA_T_CONTIG: tl.constexpr, DG_T_CONTIG: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,

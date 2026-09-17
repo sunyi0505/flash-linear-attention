@@ -57,14 +57,14 @@ def _get_gate_bwd_bt(T: int) -> int:
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'H'])
 def gdn_gate_fwd_kernel_npu(
     g,
     A_log,
     dt_bias,
     yg,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     NT_OFFSET: tl.constexpr,
@@ -123,7 +123,7 @@ def _launch_gate_fwd(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'H'])
 def gdn_gate_chunk_cumsum_scalar_kernel_npu(
     g,
     A_log,
@@ -133,7 +133,7 @@ def gdn_gate_chunk_cumsum_scalar_kernel_npu(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -219,7 +219,7 @@ def _launch_gate_chunk_cumsum(
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'H'])
 def gdn_gate_bwd_kernel_npu(
     g,
     A_log,
@@ -228,7 +228,7 @@ def gdn_gate_bwd_kernel_npu(
     dg,
     dA,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     NT_OFFSET: tl.constexpr,

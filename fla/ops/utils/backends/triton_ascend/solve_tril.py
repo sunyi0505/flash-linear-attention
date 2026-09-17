@@ -38,14 +38,14 @@ def _launch_solve_tril_kernel(kernel, *, NT: int, bh_total: int, kernel_kwargs: 
             kernel[(nt_len, bh_len)](num_warps=_NUM_WARPS, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET', 'H'])
 def solve_tril_16x16_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_OFFSET,
@@ -86,14 +86,14 @@ def solve_tril_16x16_kernel_npu(
     tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET', 'H'])
 def merge_16x16_to_32x32_inverse_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_OFFSET,
@@ -153,14 +153,14 @@ def merge_16x16_to_32x32_inverse_kernel_npu(
     tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET', 'H'])
 def merge_16x16_to_64x64_inverse_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_OFFSET,

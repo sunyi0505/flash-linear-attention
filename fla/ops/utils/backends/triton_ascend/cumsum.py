@@ -138,7 +138,7 @@ def _launch_local_cumsum_vector(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T', 'B', 'task_num', 'num_core'])
+@triton.jit(do_not_specialize=['T', 'B', 'task_num', 'num_core', 'H'])
 def chunk_local_cumsum_scalar_kernel_npu(
     s,
     o,
@@ -149,7 +149,7 @@ def chunk_local_cumsum_scalar_kernel_npu(
     B,
     task_num,
     num_core,
-    H: tl.constexpr,
+    H,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,

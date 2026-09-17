@@ -180,15 +180,19 @@ def _g_npu_arg(g: torch.Tensor | None, HV: int) -> tuple[torch.Tensor | None, bo
     return g.transpose(1, 2).contiguous(), True
 
 
+def _k_first(t: torch.Tensor | None) -> torch.Tensor | None:
+    return None if t is None else t.transpose(-2, -1).contiguous()
+
+
 @triton.jit
-def _g_contig_base(g, bos, i_b, i_h, T_seq, HV, IS_VARLEN: tl.constexpr):
+def _g_contig_base(g, bos, i_b, i_h, T_seq, HV, IS_VARLEN):
     if IS_VARLEN:
         return g + bos + i_h * T_seq
     return g + tl.cast(i_b, tl.int64) * HV * T_seq + i_h * T_seq
 
 
 @triton.jit
-def _g_block_ptr(g_base, T, offset, BC, G_T_CONTIG: tl.constexpr, HV: tl.constexpr):
+def _g_block_ptr(g_base, T, offset, BC, G_T_CONTIG: tl.constexpr, HV):
     if G_T_CONTIG:
         return tl.make_block_ptr(g_base, (T,), (1,), (offset,), (BC,), (0,))
     return tl.make_block_ptr(g_base, (T,), (HV,), (offset,), (BC,), (0,))
@@ -205,14 +209,6 @@ def get_npu_properties():
         "USE_G_GAMMA": lambda args: args["g_gamma"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': 128}),
-        triton.Config({'BK': 64}),
-        triton.Config({'BK': 32}),
-    ],
-    key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
 )
 @triton.jit(do_not_specialize=["T", "total_chunks", "task_num", "num_core", "H", "HV", "K", "V", "N"])
 def chunk_fwd_kernel_o_npu(
@@ -376,6 +372,8 @@ def chunk_fwd_o_npu(
 
     if g is not None:
         g = g.transpose(1, 2).contiguous()
+    if state_v_first:
+        h = _k_first(h)
     chunk_fwd_kernel_o_npu[(num_core,)](
         q=q,
         k=k,
@@ -397,8 +395,9 @@ def chunk_fwd_o_npu(
         task_num=task_num,
         num_core=num_core,
         BT=BT,
+        BK=64,
         BV=BV,
-        STATE_V_FIRST=state_v_first,
+        STATE_V_FIRST=False,
     )
     return o
 
@@ -464,9 +463,9 @@ def chunk_bwd_kernel_dv_local_full_npu(
     T,
     task_num,
     num_core,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    B,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -552,8 +551,8 @@ def chunk_bwd_kernel_dv_local_npu(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -718,8 +717,8 @@ def chunk_bwd_kernel_dqkwg_npu(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -933,9 +932,9 @@ def chunk_bwd_kernel_dqkwg_full_npu(
     T,
     task_num,
     num_core,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    B,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -1091,8 +1090,8 @@ def chunk_bwd_kernel_dg_hdh_npu(
     T,
     task_num,
     num_core,
-    B: tl.constexpr,
-    HV: tl.constexpr,
+    B,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -1167,10 +1166,10 @@ def chunk_bwd_kernel_dg_npu(
     dg,
     cu_seqlens,
     chunk_indices,
-    B: tl.constexpr,
+    B,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    H,
+    HV,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -1392,6 +1391,10 @@ def chunk_bwd_dqkwg_npu(
     use_dw = w is not None
     # Ungated full-BT hits Triton-Ascend `tl.trans` cc→cc copy on Cube-resident
     # ds[BT,BT]. Gated paths flush ds via exp2 (vector) and compile cleanly.
+    # Host-convert V-first states so kernels only compile the K-first layout.
+    if state_v_first:
+        h = _k_first(h)
+        dh = _k_first(dh)
     full_tiles = _get_dqkwg_full_tiles(BT, K, V, use_dw)
     use_full = full_tiles is not None and (g is not None or g_gamma is not None)
     if use_full:
@@ -1443,7 +1446,7 @@ def chunk_bwd_dqkwg_npu(
         'USE_G_GAMMA': g_gamma is not None,
         'USE_DW': use_dw,
         'G_T_CONTIG': g_t_contig,
-        'STATE_V_FIRST': state_v_first,
+        'STATE_V_FIRST': False,
         'IS_VARLEN': cu_seqlens is not None,
     }
     if use_full:
@@ -1497,7 +1500,7 @@ def chunk_bwd_dqkwg_npu(
                 'BK': BK,
                 'BV': BV,
                 'G_T_CONTIG': g_t_contig,
-                'STATE_V_FIRST': state_v_first,
+                'STATE_V_FIRST': False,
                 'IS_VARLEN': cu_seqlens is not None,
                 'K_OFFSET': 0,
                 'NT_OFFSET': 0,
@@ -1531,7 +1534,7 @@ def chunk_bwd_dqkwg_npu(
                 BK=hdh_bk,
                 BV=hdh_bv,
                 G_T_CONTIG=g_t_contig,
-                STATE_V_FIRST=state_v_first,
+                STATE_V_FIRST=False,
                 IS_VARLEN=cu_seqlens is not None,
             )
     return dq, dk, dw, dg

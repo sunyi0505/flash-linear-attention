@@ -44,7 +44,7 @@ def _get_fwd_bk(BT: int, K: int) -> int:
     'USE_G': lambda args: args['g'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T', 'B', 'task_num', 'num_core'])
+@triton.jit(do_not_specialize=['T', 'B', 'task_num', 'num_core', 'H', 'HV'])
 def chunk_scaled_dot_kkt_fwd_kernel_npu(
     k,
     g,
@@ -56,8 +56,8 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     B,
     task_num: tl.int64,
     num_core,
-    H: tl.constexpr,
-    HV: tl.constexpr,
+    H,
+    HV,
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
