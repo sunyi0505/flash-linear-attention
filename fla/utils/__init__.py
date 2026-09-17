@@ -66,7 +66,14 @@ from ._device import (  # noqa: F401
     get_multiprocessor_count,
     map_triton_backend_to_torch_device,
 )
-from ._testing import assert_close, get_abs_err, get_err_ratio  # noqa: F401
+from ._testing import (  # noqa: F401
+    aligned_atol_for_dtype,
+    assert_aligned,
+    assert_close,
+    get_abs_err,
+    get_err_ratio,
+    last_dim_byte_aligned,
+)
 
 
 def _register_aliases():

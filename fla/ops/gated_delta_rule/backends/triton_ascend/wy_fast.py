@@ -16,7 +16,7 @@ import triton.runtime.driver as driver
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
-from fla.utils import ascend_compile_kwargs, input_guard
+from fla.utils import ascend_compile_kwargs, input_guard, npu_leftover_mask, npu_pad, npu_pad_last_dim
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
@@ -169,10 +169,10 @@ def recompute_w_u_fwd_kernel_npu(
             i_t = i_t_o
             bos = tl.cast(i_b, tl.int64) * T_seq
 
-        k_ptr = k + (bos * H + i_h // (HV // H)) * K
-        v_ptr = v + (bos * HV + i_h) * V
-        u_ptr = u + (bos * HV + i_h) * V
-        w_ptr = w + (bos * HV + i_h) * K
+        k_ptr = k + (bos * H + i_h // (HV // H)) * KP
+        v_ptr = v + (bos * HV + i_h) * VP
+        u_ptr = u + (bos * HV + i_h) * VP
+        w_ptr = w + (bos * HV + i_h) * KP
         if BETA_T_CONTIG:
             beta_ptr = _g_contig_base(beta, bos, i_b, i_h, T_seq, HV, IS_VARLEN)
         else:
@@ -191,7 +191,7 @@ def recompute_w_u_fwd_kernel_npu(
             b_g = exp2(tl.load(p_g, boundary_check=(0,)).to(tl.float32))
         for i_v in range(tl.cdiv(V, BV)):
             p_v = tl.make_block_ptr(
-                v_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+                v_ptr, (T, VP), (HV * VP, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
             )
             p_u = tl.make_block_ptr(
                 u_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
@@ -204,7 +204,7 @@ def recompute_w_u_fwd_kernel_npu(
             tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(
-                k_ptr, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                k_ptr, (T, KP), (H * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
             )
             p_w = tl.make_block_ptr(
                 w_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
@@ -290,18 +290,18 @@ def prepare_wy_repr_bwd_kv_npu(
             b_bg = b_b * b_g_exp
             b_dg = tl.zeros([BT], dtype=tl.float32)
 
-        k_ptr = k + (bos * H + i_h // (HV // H)) * K
-        dk_ptr = dk + (bos * HV + i_h) * K
-        dw_ptr = dw + (bos * HV + i_h) * K
+        k_ptr = k + (bos * H + i_h // (HV // H)) * KP
+        dk_ptr = dk + (bos * HV + i_h) * KP
+        dw_ptr = dw + (bos * HV + i_h) * KP
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(
-                k_ptr, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                k_ptr, (T, KP), (H * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
             )
             p_dk = tl.make_block_ptr(
                 dk_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
             )
             p_dw = tl.make_block_ptr(
-                dw_ptr, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                dw_ptr, (T, KP), (HV * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_G:
@@ -324,18 +324,18 @@ def prepare_wy_repr_bwd_kv_npu(
                 b_db += tl.sum(b_dkbg * b_k_f, 1)
             tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
-        v_ptr = v + (bos * HV + i_h) * V
-        dv_ptr = dv + (bos * HV + i_h) * V
-        du_ptr = du + (bos * HV + i_h) * V
+        v_ptr = v + (bos * HV + i_h) * VP
+        dv_ptr = dv + (bos * HV + i_h) * VP
+        du_ptr = du + (bos * HV + i_h) * VP
         for i_v in range(tl.cdiv(V, BV)):
             p_v = tl.make_block_ptr(
-                v_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+                v_ptr, (T, VP), (HV * VP, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
             )
             p_dv = tl.make_block_ptr(
                 dv_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
             )
             p_du = tl.make_block_ptr(
-                du_ptr, (T, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
+                du_ptr, (T, VP), (HV * VP, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0),
             )
             b_v = tl.load(p_v, boundary_check=(0, 1))
             b_du = tl.load(p_du, boundary_check=(0, 1))
@@ -523,7 +523,7 @@ def prepare_wy_repr_bwd_finalize_k_npu(
 
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(
-                k + (bos * H + i_h // (HV // H)) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+                k + (bos * H + i_h // (HV // H)) * KP, (T, KP), (H * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
             )
             p_dk = tl.make_block_ptr(
                 dk + (bos * HV + i_h) * K, (T, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
@@ -546,7 +546,7 @@ def prepare_wy_repr_bwd_finalize_a2_dg_npu(
     k, beta, dA_out, dg,
     cu_seqlens, chunk_indices, T,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
-    BT: tl.constexpr, BK: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, KP: tl.constexpr,
     IS_VARLEN: tl.constexpr, BETA_T_CONTIG: tl.constexpr, DG_T_CONTIG: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
 ):
@@ -580,7 +580,7 @@ def prepare_wy_repr_bwd_finalize_a2_dg_npu(
     b_A2 = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
-            k + (bos * H + i_h // (HV // H)) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
+            k + (bos * H + i_h // (HV // H)) * KP, (T, KP), (H * KP, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0),
         )
         b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
         b_k_c = b_k + 0.0
@@ -627,8 +627,21 @@ def recompute_w_u_fwd_npu(
             if best_cost is None or cost < best_cost or (cost == best_cost and bk + bv > BK + BV):
                 best_cost, BK, BV = cost, bk, bv
 
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, HV, K)
+    mask_leftover = npu_leftover_mask(
+        T=T, BT=BT, K=K, BK=BK, V=V, BV=BV, varlen=cu_seqlens is not None,
+    )
+    if mask_leftover:
+        BK = min(64, BK)
+        BV = min(64, BV)
+
+    KP, VP = npu_pad(K, BK), npu_pad(V, BV)
+    k = npu_pad_last_dim(k, KP)
+    v = npu_pad_last_dim(v, VP)
+    zero_ws = mask_leftover or KP != K or VP != V
+    alloc_k = k.new_zeros if zero_ws else k.new_empty
+    alloc_v = v.new_zeros if zero_ws else v.new_empty
+    u = alloc_v(B, T, HV, VP)
+    w = alloc_k(B, T, HV, KP)
     beta, beta_t_contig = _beta_npu_arg(beta, HV)
     g, g_t_contig = _g_npu_arg(g, HV)
 
@@ -682,9 +695,26 @@ def prepare_wy_repr_bwd_npu(
     BK_FIN = _bwd_col_tile(BT, K, _PREPARE_BWD_K_MEM_MULT, _MAX_TILE_BWD)
     use_g = g is not None
     is_varlen = cu_seqlens is not None
+    mask_leftover = npu_leftover_mask(
+        T=T, BT=BT, K=K, BK=BK, V=V, BV=BV, varlen=is_varlen,
+    )
+    mask_leftover_fin = npu_leftover_mask(
+        T=T, BT=BT, K=K, BK=BK_FIN, varlen=is_varlen,
+    )
+    if mask_leftover:
+        BK = min(64, BK)
+        BV = min(64, BV)
+    if mask_leftover_fin:
+        BK_FIN = min(64, BK_FIN)
 
-    dk = k.new_empty(B, T, HV, K)
-    dv = torch.empty_like(v)
+    KP, VP = npu_pad(K, max(BK, BK_FIN)), npu_pad(V, BV)
+    k = npu_pad_last_dim(k, KP)
+    v = npu_pad_last_dim(v, VP)
+    dw = npu_pad_last_dim(dw, KP)
+    du = npu_pad_last_dim(du, VP)
+    zero_ws = mask_leftover or mask_leftover_fin or KP != K or VP != V
+    dk = k.new_zeros(B, T, HV, KP) if zero_ws else k.new_empty(B, T, HV, KP)
+    dv = v.new_zeros(B, T, HV, VP) if zero_ws else v.new_empty(B, T, HV, VP)
     db, db_t_contig = _t_npu_buf(B, T, HV, dtype=beta.dtype, device=k.device)
     beta_arg, beta_t_contig = _beta_npu_arg(beta, HV)
     dg, dg_t_contig = None, False
@@ -772,7 +802,7 @@ def prepare_wy_repr_bwd_npu(
             bh_total=B * HV,
             kernel_kwargs=dict(
                 k=k, beta=beta_arg, dA_out=dA_out, dg=dg_arg,
-                H=H, HV=HV, K=K, BK=BK_FIN,
+                H=H, HV=HV, K=K, BK=BK_FIN, KP=KP,
                 BETA_T_CONTIG=beta_t_contig, DG_T_CONTIG=dg_t_contig,
                 **base,
             ),

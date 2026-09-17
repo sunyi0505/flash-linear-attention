@@ -152,6 +152,7 @@ jobs:
             tests/modules \
             tests/ops/utils \
             tests/ops/test_gdn_kernels.py \
+            tests/ops/test_npu_unaligned_last_dim.py \
             tests/ops/test_gdn.py \
             tests/ops/test_gdn2.py \
             tests/ops/test_kda.py \
