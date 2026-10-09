@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.common.backends.triton_ascend.chunk_delta_h import mload, mstore, need_dma_mask
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
 from fla.utils import input_guard
@@ -26,8 +27,11 @@ _MAX_BK_FWD = 128
 
 
 def _get_fwd_bk(BT: int, K: int) -> int:
-    """UB-safe BK tile size for chunk_scaled_dot_kkt_fwd on NPU."""
-    return compute_row_tile_block_size(
+    """UB-safe BK tile size for chunk_scaled_dot_kkt_fwd on NPU.
+
+    Step down to a divisor of ``K`` when one exists, so aligned launches can drop the DMA mask.
+    """
+    bk = compute_row_tile_block_size(
         BT,
         K,
         _CHUNK_SCALED_DOT_KKT_MEM_MULT,
@@ -38,6 +42,9 @@ def _get_fwd_bk(BT: int, K: int) -> int:
         min_block=16,
         max_block=min(_MAX_BK_FWD, triton.next_power_of_2(K)),
     )
+    while bk > 16 and K % bk != 0:
+        bk //= 2
+    return bk
 
 
 @triton.heuristics({
@@ -63,6 +70,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
+    MASK_DMA: tl.constexpr,
 ):
     T = T.to(tl.int64)
     bt_stride = B.to(tl.int64) * T
@@ -84,24 +92,22 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
         o_t = i_t * BT + o_i
         m_t = o_t < T
         m_A = m_causal & (m_t[:, None] & m_t)
-        # make_block_ptr offsets must be 32-bit; keep 64-bit o_t for regular indexing.
-        t_off = (i_t * BT).to(tl.int32)
-        # 1-token chunks: strictly-lower-tri kkt is 0; T=1 block_ptr misaligns UB.
+        # 1-token chunks: strictly-lower-tri kkt is 0.
         if i_t * BT + 1 < T:
-            p_b = tl.make_block_ptr(beta + i_h * bt_stride + bos, (T,), (1,), (t_off,), (BT,), (0,))
-            b_b = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
+            p_b = beta + i_h * bt_stride + bos + o_t
+            b_b = mload(p_b, m_t, MASK_DMA).to(tl.float32)
 
             if USE_G:
-                p_g = tl.make_block_ptr(g + i_h * bt_stride + bos, (T,), (1,), (t_off,), (BT,), (0,))
-                b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+                p_g = g + i_h * bt_stride + bos + o_t
+                b_g = mload(p_g, m_t, MASK_DMA).to(tl.float32)
 
             b_A = tl.zeros([BT, BT], dtype=tl.float32)
             for i_k in range(tl.cdiv(K, BK)):
-                p_k = tl.make_block_ptr(
-                    k + (bos * H + i_h // (HV // H)) * K, (T, K), (H * K, 1),
-                    (t_off, i_k * BK), (BT, BK), (1, 0),
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+                o_k = i_k * BK + tl.arange(0, BK)
+                m_k = (o_k >= 0) & (o_k < K)
+                m_p_k = m_t[:, None] & m_k[None, :]
+                p_k = k + (bos * H + i_h // (HV // H)) * K + o_t[:, None] * (H * K) + o_k[None, :]
+                b_k = mload(p_k, m_p_k, MASK_DMA).to(tl.float32)
                 # ascend tl.dot may clobber lhs; keep rhs on the original tile.
                 b_k_lhs = b_k + 0.0
                 b_A = tl.dot(b_k_lhs, tl.trans(b_k), b_A, allow_tf32=False)
@@ -114,7 +120,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
             b_A = tl.where(m_A, b_A, 0)
 
             p_A = A + (bos * HV + i_h) * BT + o_t[:, None] * (BT * HV) + o_i[None, :]
-            tl.store(p_A, b_A.to(p_A.dtype.element_ty), mask=m_t[:, None])
+            mstore(p_A, b_A.to(p_A.dtype.element_ty), m_t[:, None], MASK_DMA)
 
 
 @input_guard
@@ -178,5 +184,6 @@ def chunk_scaled_dot_kkt_fwd_npu(
         K=K,
         BT=BT,
         BK=BK,
+        MASK_DMA=need_dma_mask(T, BT, K, BK, K, BK, cu_seqlens is not None),
     )
     return A

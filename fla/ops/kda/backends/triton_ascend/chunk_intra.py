@@ -172,8 +172,13 @@ def chunk_kda_fwd_kernel_diag_solve_npu(
     m_A = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
 
-    p_Akk = tl.make_block_ptr(Akkd, (T, BC), (HV * BC, 1), (i_ti, 0), (BC, BC), (1, 0))
-    b_Akk = tl.load(p_Akk, boundary_check=(0, 1)).to(tl.float32)
+    o_t = i_ti + tl.arange(0, BC)
+    m_t = (o_t >= 0) & (o_t < T)
+    o_i_2 = tl.arange(0, BC)
+    m_i_2 = (o_i_2 >= 0) & (o_i_2 < BC)
+    m_p_Akk = m_t[:, None] & m_i_2[None, :]
+    p_Akk = Akkd + o_t[:, None] * (HV * BC) + o_i_2[None, :]
+    b_Akk = tl.load(p_Akk, mask=m_p_Akk, other=0).to(tl.float32)
     b_Ai = -tl.where(m_A, b_Akk, 0)
     for i in range(2, min(BC, T - i_ti)):
         b_a = -tl.load(Akkd + (i_ti + i).to(tl.int64) * HV * BC + o_i)
@@ -181,7 +186,7 @@ def chunk_kda_fwd_kernel_diag_solve_npu(
         b_a += tl.sum(b_a[:, None] * b_Ai, 0)
         b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
     b_Ai += m_I
-    tl.store(p_Akk, b_Ai.to(Akkd.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Akk, b_Ai.to(Akkd.dtype.element_ty), mask=m_p_Akk)
 
 
 @triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'])
@@ -235,16 +240,21 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_npu(
     Aqk = Aqk + (bos * HV + i_hv) * BT
     Akk = Akk + (bos * HV + i_hv) * BC
 
-    p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
-    p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
-    p_g = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_ti, 0), (BC, BK), (1, 0))
+    o_t = i_ti + tl.arange(0, BC)
+    m_t = (o_t >= 0) & (o_t < T)
+    o_i_2 = tl.arange(0, BK)
+    m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
+    m_p_q = m_t[:, None] & m_i_2[None, :]
+    p_q = q + o_t[:, None] * (H * K) + o_i_2[None, :]
+    p_k = k + o_t[:, None] * (H * K) + o_i_2[None, :]
+    p_g = g + o_t[:, None] * (HV * K) + o_i_2[None, :]
 
-    p_beta = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
+    p_beta = beta + o_t * HV
 
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    b_q = tl.load(p_q, mask=m_p_q, other=0)
+    b_k = tl.load(p_k, mask=m_p_q, other=0)
+    b_g = tl.load(p_g, mask=m_p_q, other=0)
+    b_beta = tl.load(p_beta, mask=m_t, other=0)
 
     p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)).to(tl.int64) * HV * K + tl.arange(0, BK)
     b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
@@ -267,10 +277,16 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_npu(
     b_Aqk = tl.where(m_Aqk, b_Aqk, 0.0)
     b_Akk = tl.where(m_Akk, b_Akk, 0.0)
 
-    p_Aqk = tl.make_block_ptr(Aqk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0))
-    p_Akk = tl.make_block_ptr(Akk, (T, BC), (HV * BC, 1), (i_ti, 0), (BC, BC), (1, 0))
-    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+    o_t_2 = i_i * BC + tl.arange(0, BC)
+    m_t_2 = (o_t_2 >= 0) & (o_t_2 < BT)
+    m_p_Aqk = m_t[:, None] & m_t_2[None, :]
+    p_Aqk = Aqk + o_t[:, None] * (HV * BT) + o_t_2[None, :]
+    o_i_3 = tl.arange(0, BC)
+    m_i_3 = (o_i_3 >= 0) & (o_i_3 < BC)
+    m_p_Akk = m_t[:, None] & m_i_3[None, :]
+    p_Akk = Akk + o_t[:, None] * (HV * BC) + o_i_3[None, :]
+    tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), mask=m_p_Aqk)
+    tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), mask=m_p_Akk)
 
 
 @triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
@@ -816,7 +832,8 @@ def chunk_kda_bwd_kernel_intra_npu(
                     b_dk2 += tl.where(m_i, b_dAkk_j[:, None] * b_kj[None, :] * b_gqk, 0.)
 
             # ---- first-half outputs: dq2/db (past + diag contributions) ----
-            b_db = tl.sum(b_dk2 * b_k.to(tl.float32), 1)
+            # Dot N-padding past K can be NaN; don't let it poison the K reduction.
+            b_db = tl.sum(tl.where(m_k[None, :], b_dk2 * b_k.to(tl.float32), 0), 1)
             b_dk2 = b_dk2 * b_b.to(tl.float32)[:, None]
             b_dg2 = b_q.to(tl.float32) * b_dq2
             b_dq2 += tl.load(dq_l + i_ti * (HV * K) + o_i[:, None] * (HV * K) +

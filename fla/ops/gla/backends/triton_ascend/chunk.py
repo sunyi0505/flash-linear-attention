@@ -387,18 +387,29 @@ def chunk_gla_fwd_kernel_o_npu(
 
         b_o = tl.zeros([BT, BV], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
-            p_q = tl.make_block_ptr(q_ptr, (T_cur, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-            p_g = tl.make_block_ptr(g_ptr, (T_cur, K), (HV * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+            o_t_2 = i_t * BT + tl.arange(0, BT)
+            m_t_2 = (o_t_2 >= 0) & (o_t_2 < T_cur)
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = (o_k >= 0) & (o_k < K)
+            m_p_q = m_t_2[:, None] & m_k[None, :]
+            p_q = q_ptr + o_t_2[:, None] * (H * K) + o_k[None, :]
+            p_g = g_ptr + o_t_2[:, None] * (HV * K) + o_k[None, :]
             if STATE_V_FIRST:
-                p_h = tl.make_block_ptr(h_base, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+                o_v = i_v * BV + tl.arange(0, BV)
+                m_v = (o_v >= 0) & (o_v < V)
+                m_p_h = m_v[:, None] & m_k[None, :]
+                p_h = h_base + o_v[:, None] * K + o_k[None, :]
             else:
-                p_h = tl.make_block_ptr(h_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+                o_v = i_v * BV + tl.arange(0, BV)
+                m_v = (o_v >= 0) & (o_v < V)
+                m_p_h = m_k[:, None] & m_v[None, :]
+                p_h = h_base + o_k[:, None] * V + o_v[None, :]
+            b_q = tl.load(p_q, mask=m_p_q, other=0)
+            b_g = tl.load(p_g, mask=m_p_q, other=0).to(tl.float32)
             # fold scale into the operand: an elementwise op on the accumulator
             # between the two dots forces a fixpipe round-trip through UB
             b_qg = (b_q * exp2(b_g) * scale).to(b_q.dtype)
-            b_h = tl.load(p_h, boundary_check=(0, 1))
+            b_h = tl.load(p_h, mask=m_p_h, other=0)
             if STATE_V_FIRST:
                 b_o = tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype), b_o)
             else:
@@ -406,15 +417,23 @@ def chunk_gla_fwd_kernel_o_npu(
 
         o_t = i_t * BT + tl.arange(0, BT)
         m_t = o_t < T_cur
-        p_a = tl.make_block_ptr(a_ptr, (T_cur, BT), (HV * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-        p_v = tl.make_block_ptr(v_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_o = tl.make_block_ptr(o_ptr, (T_cur, V), (HV * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_A = tl.load(p_a, boundary_check=(0, 1))
+        o_t_2 = i_t * BT + tl.arange(0, BT)
+        m_t_2 = (o_t_2 >= 0) & (o_t_2 < T_cur)
+        o_i = tl.arange(0, BT)
+        m_i = (o_i >= 0) & (o_i < BT)
+        m_p_a = m_t_2[:, None] & m_i[None, :]
+        p_a = a_ptr + o_t_2[:, None] * (HV * BT) + o_i[None, :]
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = (o_v >= 0) & (o_v < V)
+        m_p_v = m_t_2[:, None] & m_v[None, :]
+        p_v = v_ptr + o_t_2[:, None] * (HV * V) + o_v[None, :]
+        p_o = o_ptr + o_t_2[:, None] * (HV * V) + o_v[None, :]
+        b_A = tl.load(p_a, mask=m_p_a, other=0)
         m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
         b_A = tl.where(m_s & (m_t[:, None] & m_t[None, :]), b_A, 0.0)
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_v = tl.load(p_v, mask=m_p_v, other=0)
         b_o = tl.dot(b_A.to(b_v.dtype), b_v, b_o)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_p_v)
 
 
 @input_guard
