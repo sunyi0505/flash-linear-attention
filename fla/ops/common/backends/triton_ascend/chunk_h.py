@@ -7,8 +7,11 @@
 
 """GLA state kernels for Ascend NPU.
 
-Ascend requires host-specialized `NT` with `tl.static_range(NT)`;
-a dynamic loop under-iterates when `T` is unspecialized.
+`NT` is host-specialized. A dynamic `range(tl.cdiv(T, BT))` under-iterates when
+`T` is unspecialized, but `tl.static_range(NT)` duplicates the body: at NT=128
+(T=8192, chunk 64) BiSheng spends minutes in compile, and NT=256 overflows the
+AIV frame. `tl.range(NT, loop_unroll_factor=1)` keeps the exact trip count in
+one loop body.
 The host wrappers split packed variable-length inputs into individual sequences.
 """
 
@@ -96,7 +99,7 @@ def chunk_h_fwd_kernel(
             p_h0 = h0 + h0_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_h = tl.load(p_h0, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for i_t in tl.static_range(NT):
+    for i_t in tl.range(NT, loop_unroll_factor=1):
         i_s = i_t // NTS
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
@@ -118,7 +121,7 @@ def chunk_h_fwd_kernel(
         # fp32 recurrence avoids instability from bf16 tl.dot on Ascend.
         b_k = tl.load(p_k, mask=(o_k[:, None] < K) & m_t[None, :], other=0.0).to(tl.float32)
         b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
-        last_idx = min((i_t + 1) * BT, T) - 1
+        last_idx = tl.minimum((i_t + 1) * BT, T) - 1
 
         if USE_G:
             b_g_last = tl.load(g + bos * H + last_idx.to(tl.int64) * H + i_h).to(tl.float32)
@@ -128,7 +131,7 @@ def chunk_h_fwd_kernel(
             b_v = b_v * exp2(b_g_last - b_g)[:, None]
 
         if USE_G_GAMMA:
-            b_g_last = b_gamma * min(BT, T - i_t * BT)
+            b_g_last = b_gamma * tl.minimum(BT, T - i_t * BT)
             b_h *= exp2(b_g_last)
             b_v = b_v * exp2(b_g_last - b_g)[:, None]
 
@@ -222,7 +225,7 @@ def chunk_h_bwd_kernel(
             p_dht = dht + dht_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_dh += tl.load(p_dht, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for step in tl.static_range(NT):
+    for step in tl.range(NT, loop_unroll_factor=1):
         i_t = NT - 1 - step
         i_s = i_t // (BS // BT)
         o_dh = ((boh + i_s) * H + i_h) * K * V
@@ -236,7 +239,7 @@ def chunk_h_bwd_kernel(
         if i_t % (BS // BT) == 0:
             tl.store(p_dh, (tl.trans(b_dh) if STATE_V_FIRST else b_dh).to(p_dh.dtype.element_ty), mask=m_dh)
 
-        last_idx = min(i_t * BT + BT, T) - 1
+        last_idx = tl.minimum(i_t * BT + BT, T) - 1
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
         qv_base = bos * HQ + i_hq
@@ -253,7 +256,7 @@ def chunk_h_bwd_kernel(
             b_dh *= exp2(b_g_last)
 
         if USE_G_GAMMA:
-            b_g_last = b_gamma * min(BT, T - i_t * BT)
+            b_g_last = b_gamma * tl.minimum(BT, T - i_t * BT)
             b_q = b_q * exp2(b_g)[None, :]
             b_dh *= exp2(b_g_last)
 

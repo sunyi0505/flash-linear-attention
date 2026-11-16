@@ -195,9 +195,9 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
     b_q = tl.load(p_q_base + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
     b_g = tl.load(p_g_base + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
-    # intra diagonal: fixed tl.static_range(BC) with a per-j active mask
+    # intra diagonal: BC is constexpr, but unrolling copies the masked column update.
     max_j = min(BC, T - i_t * BT - i_i * BC)
-    for j in tl.static_range(BC):
+    for j in tl.range(BC, loop_unroll_factor=1):
         active = j < max_j
         b_k = tl.load(p_k_base + (i_t * BT + i_j * BC + j) * H * K + o_k, mask=m_k & active, other=0).to(tl.float32)
         b_gk = tl.load(p_g_base + (i_t * BT + i_j * BC + j) * H * K + o_k, mask=m_k & active, other=0).to(tl.float32)
@@ -254,7 +254,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
     b_g = tl.load(p_g_base + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
     max_j = min(BC, T - i_t * BT - i_i * BC)
-    for j in tl.static_range(BC):
+    for j in tl.range(BC, loop_unroll_factor=1):
         active = j < max_j
         b_k = tl.load(p_k_base + (i_t * BT + i_j * BC + j) * H * K + o_k, mask=m_k & active, other=0).to(tl.float32)
         b_gk = tl.load(p_g_base + (i_t * BT + i_j * BC + j) * H * K + o_k, mask=m_k & active, other=0).to(tl.float32)
@@ -480,7 +480,7 @@ def chunk_gla_bwd_kernel_intra_npu(
     m_dA = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
     o_dA = bos * H * BT + (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BT + i_h * BT + i_i * BC
     max_j = min(BC, T - i_t * BT - i_i * BC)
-    for j in tl.static_range(BC):
+    for j in tl.range(BC, loop_unroll_factor=1):
         active = j < max_j
         b_dAj = tl.load(dA + o_dA + j, mask=m_dA & active, other=0).to(tl.float32)
         b_kj = tl.load(k + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k, mask=m_k & active, other=0).to(tl.float32)
@@ -518,7 +518,7 @@ def chunk_gla_bwd_kernel_intra_npu(
         b_dk *= exp2(b_gn2[None, :] - b_g)
 
     o_dA2 = bos * H * BT + (i_t * BT + i_i * BC) * H * BT + i_h * BT + i_i * BC + tl.arange(0, BC)
-    for j in tl.static_range(BC):
+    for j in tl.range(BC, loop_unroll_factor=1):
         active = j < max_j
         b_dAj = tl.load(dA + o_dA2 + j * H * BT, mask=active, other=0).to(tl.float32)
         b_qj = tl.load(q + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k, mask=m_k & active, other=0).to(tl.float32)

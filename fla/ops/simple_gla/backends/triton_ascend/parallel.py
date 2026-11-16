@@ -70,7 +70,8 @@ def parallel_attn_npu_kernel(
         b_gk = tl.load(gc + g_base + o_k * H, mask=m_k, other=0.0).to(tl.float32)
 
     b_s = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_kk in tl.static_range(NK):
+    # NK = cdiv(K, BK) is constexpr; unrolling copies the dot once per K-slab.
+    for i_kk in tl.range(NK, loop_unroll_factor=1):
         o_kk = i_kk * BK + tl.arange(0, BK)
         m_kk = (o_kk < K)[:, None]
         b_q = tl.load(q + qk_base + o_q[:, None] * (H * K) + o_kk[None, :], mask=m_q[:, None] & (o_kk < K)[None, :], other=0.0)
