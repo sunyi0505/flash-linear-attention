@@ -1803,6 +1803,8 @@ def chunk_bwd_dqkwg_npu(
         dqkwg_kwargs['dg'] = dg if dg is not None else dq
         dqkwg_kwargs['B'] = B
         num_core = get_npu_properties()["num_aicore"]
+        compile_opts = ascend_compile_kwargs()
+        workspace_opts = {k: v for k, v in compile_opts.items() if k != 'multibuffer'}
         if cu_seqlens is not None:
             dqkwg_kwargs['chunk_offsets'] = prepare_chunk_offsets(cu_seqlens, BT)
             if not torch.npu.is_current_stream_capturing():
@@ -1825,7 +1827,8 @@ def chunk_bwd_dqkwg_npu(
                 'task_num': pass_task_num,
                 'num_core': pass_num_core,
             }
-            dqkwg_kernel[(pass_num_core,)](**pass_kwargs)
+            # Masked loads can produce NaNs with local multibuffering enabled.
+            dqkwg_kernel[(pass_num_core,)](**pass_kwargs, **(compile_opts if pass_kwargs['MASK_DMA'] else workspace_opts))
     else:
         dqkwg_kwargs['dq_f32'] = dq_f32
         dqkwg_kwargs['dk_f32'] = dk_f32
@@ -1833,6 +1836,8 @@ def chunk_bwd_dqkwg_npu(
         dqkwg_kwargs['K_OFFSET'] = 0
         dqkwg_kwargs['NT_OFFSET'] = 0
         dqkwg_kwargs['BH_OFFSET'] = 0
+        # Dynamic CV pipelining hits a cross-block ordering assertion in the tiled kernel.
+        dqkwg_kwargs['enable_dynamic_cv_pipeline'] = False
         _launch_bwd_3d_kernel(kernel=dqkwg_kernel, nk=NK, nt=NT, bh_total=B * HV, kernel_kwargs=dqkwg_kwargs)
 
     if dg is not None and not use_full:

@@ -32,6 +32,7 @@ from fla.utils.ascend_ub_manager import (
     get_npu_properties,
     get_ub_manager,
 )
+from fla.utils.hardware import IS_ASCEND_950
 
 
 @lru_cache(maxsize=4)
@@ -565,7 +566,8 @@ def _launch_core_grid(kernel, *, task_num: int, kernel_kwargs: dict, **compile_o
 
 # enable_ubuf_saving packs BK=256/BV=128 into 192 KiB; unit_flag overlaps Cube/Fixpipe waits.
 _FWD_H_COMPILE = dict(enable_ubuf_saving=True, unit_flag=True)
-_DHU_COMPILE = dict(enable_ubuf_saving=True, unit_flag=True)
+# cube/fixpipe overlap can deadlock the reverse recurrence, including aligned dense chunks.
+_DHU_COMPILE = dict(enable_ubuf_saving=True, unit_flag=False if IS_ASCEND_950 else True)
 
 _FWD_H_HEURISTICS = {
     "USE_G": lambda args: args["g"] is not None or args["g_ratio"] is not None,
@@ -1353,6 +1355,12 @@ def chunk_gated_delta_rule_fwd_h_npu(
             **_FWD_H_COMPILE,
         )
     else:
+        # Cube/Fixpipe overlap can stall the packed-tail or transposed recurrence.
+        packed_tail = cu_seqlens is not None and masked
+        compile_opts = {
+            **_FWD_H_COMPILE,
+            "unit_flag": _FWD_H_COMPILE["unit_flag"] and not state_v_first and not packed_tail,
+        }
         _launch_core_grid(
             kernel=chunk_gated_delta_rule_h_fwd_kernel,
             task_num=N * HV * triton.cdiv(V, BV),
@@ -1367,7 +1375,7 @@ def chunk_gated_delta_rule_fwd_h_npu(
                     T, BT, K, BK, V, BV, cu_seqlens is not None, cu_seqlens, cu_seqlens_cpu,
                 ),
             },
-            **_FWD_H_COMPILE,
+            **compile_opts,
             **ascend_compile_kwargs(),
         )
     if K_orig != K or V_orig != V:
@@ -1568,8 +1576,10 @@ def chunk_gated_delta_rule_h_bwd_kernel(
             DH_CS: tl.constexpr = HV * K * V
             dh_chunk = dh_base + (NT - 1).to(tl.int64) * DH_CS
 
-            for phase in tl.static_range(2):
-                if phase == 0:
+            for phase in tl.static_range(1 if IS_VARLEN else 2):
+                if IS_VARLEN:
+                    chunk_start, chunk_end = NT - 1, -1
+                elif phase == 0:
                     chunk_start, chunk_end = NT - 1, T // BT - 1
                 else:
                     chunk_start, chunk_end = T // BT - 1, -1
@@ -2035,16 +2045,10 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
         masked=masked,
         use_gate=g is not None,
     )
-    # unit_flag overlaps cube and fixpipe. On the v-first transpose path that
-    # overlap deadlocks when the sequence is ragged or packed, and the device
-    # sync then times out. Aligned dense launches keep the flag.
-    compile_opts = dict(_DHU_COMPILE)
-    if state_v_first and (masked or cu_seqlens is not None):
-        compile_opts["unit_flag"] = False
     _launch_core_grid(
         kernel=chunk_gated_delta_rule_h_bwd_kernel,
         task_num=N * HV * triton.cdiv(V, BV),
-        **compile_opts,
+        **_DHU_COMPILE,
         kernel_kwargs={
             "q": q,
             "k": k,

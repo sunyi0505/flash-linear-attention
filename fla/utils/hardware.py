@@ -94,6 +94,7 @@ IS_INTEL = (device_platform == 'xpu')
 IS_INTEL_ALCHEMIST = (IS_INTEL and 'Intel(R) Arc(TM) A' in torch.xpu.get_device_name(0))
 
 IS_NPU = (device_platform == 'npu')
+IS_ASCEND_950 = (IS_NPU and get_device_arch().startswith('Ascend950'))
 
 IS_NVIDIA = (device_platform == 'cuda')
 IS_NVIDIA_HOPPER = (
@@ -210,11 +211,14 @@ else:
             return contextlib.nullcontext()
 
 
-def ascend_compile_kwargs(*, blacklist_auto_blockify: bool = False, workspace_multibuffer: int = 1) -> dict:
+def ascend_compile_kwargs(
+    *, blacklist_auto_blockify: bool = False, workspace_multibuffer: int = 1, disable_dynamic_cv_pipeline: bool = False,
+) -> dict:
     """Return NPU Triton launch kwargs that disable auto-multi-buffer.
 
     Empty on non-NPU devices. When ``blacklist_auto_blockify`` is set, also
-    disable AutoBlockify if the installed compiler accepts that override.
+    disable AutoBlockify if supported. ``disable_dynamic_cv_pipeline`` likewise
+    disables the dynamic Cube/Vector pipeline where supported.
     """
     if not IS_NPU:
         return {}
@@ -230,6 +234,9 @@ def ascend_compile_kwargs(*, blacklist_auto_blockify: bool = False, workspace_mu
     blacklist_field = fields.get('has_auto_blockify_blacklist_op')
     if blacklist_auto_blockify and blacklist_field is not None and blacklist_field.init:
         kwargs['has_auto_blockify_blacklist_op'] = True
+    dynamic_cv_field = fields.get('enable_dynamic_cv_pipeline')
+    if disable_dynamic_cv_pipeline and dynamic_cv_field is not None and dynamic_cv_field.init:
+        kwargs['enable_dynamic_cv_pipeline'] = False
     return kwargs
 
 
