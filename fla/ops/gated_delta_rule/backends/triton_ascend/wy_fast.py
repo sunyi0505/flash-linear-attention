@@ -154,10 +154,12 @@ def _launch_wy_kernel(
 
 def launch_wy_core_grid(
     kernel, *, task_num: int, kernel_kwargs: dict, disable_dynamic_cv_pipeline: bool = False,
+    compile_kwargs: dict | None = None,
 ) -> None:
     num_core = min(get_npu_properties()["num_aicore"], max(1, task_num))
-    compile_kwargs = ascend_compile_kwargs(disable_dynamic_cv_pipeline=disable_dynamic_cv_pipeline)
-    kernel[(num_core,)](task_num=task_num, num_core=num_core, **compile_kwargs, **kernel_kwargs)
+    launch_kwargs = ascend_compile_kwargs(disable_dynamic_cv_pipeline=disable_dynamic_cv_pipeline)
+    launch_kwargs.update(compile_kwargs or {})
+    kernel[(num_core,)](task_num=task_num, num_core=num_core, **launch_kwargs, **kernel_kwargs)
 
 
 def _varlen_chunk_passes(cu_seqlens, chunk_indices, chunk_size):
@@ -170,6 +172,7 @@ def _varlen_chunk_passes(cu_seqlens, chunk_indices, chunk_size):
 
 def _launch_wy_core_full_tail(
     kernel, *, task_num: int, kernel_kwargs: dict, feature_mask: bool, disable_dynamic_cv_pipeline: bool = False,
+    compile_kwargs: dict | None = None,
 ) -> None:
     cu_seqlens = kernel_kwargs.get('cu_seqlens')
     if cu_seqlens is None or torch.npu.is_current_stream_capturing():
@@ -178,6 +181,7 @@ def _launch_wy_core_full_tail(
             task_num=task_num,
             kernel_kwargs=kernel_kwargs,
             disable_dynamic_cv_pipeline=disable_dynamic_cv_pipeline,
+            compile_kwargs=compile_kwargs,
         )
         return
     for chunk_indices, is_tail in _varlen_chunk_passes(
@@ -196,6 +200,7 @@ def _launch_wy_core_full_tail(
             task_num=pass_task_num,
             kernel_kwargs=kwargs,
             disable_dynamic_cv_pipeline=disable_dynamic_cv_pipeline,
+            compile_kwargs=compile_kwargs,
         )
 
 
@@ -355,6 +360,7 @@ def prepare_wy_repr_bwd_kv_npu(
     DG_T_CONTIG: tl.constexpr, DB_T_CONTIG: tl.constexpr,
     G_EXP_PRECOMP: tl.constexpr, MASK_DMA: tl.constexpr,
     SPLIT_LOAD_MASK: tl.constexpr,
+    TRANSPOSE_DA: tl.constexpr = False,
 ):
     """K/V backward stage on a 1D Cube core-grid.
 
@@ -455,10 +461,12 @@ def prepare_wy_repr_bwd_kv_npu(
                 b_kbg = (b_k.to(tl.float32) * b_bg[:, None]).to(b_k.dtype)
             else:
                 b_kbg = (b_k.to(tl.float32) * b_b[:, None]).to(b_k.dtype)
-            # Accumulate in the stored orientation, without transposing a live
-            # Cube accumulator or feeding it back across the interleaved dots.
-            b_dw_T = tl.trans(b_dw)
-            b_dAT = b_dAT + tl.dot(b_kbg, b_dw_T, allow_tf32=False)
+            if TRANSPOSE_DA:
+                # independent Cube accumulators avoid dA feedback across the interleaved gradient dots
+                b_dAT += tl.trans(tl.dot(b_dw, tl.trans(b_kbg), allow_tf32=False))
+            else:
+                b_dw_T = tl.trans(b_dw)
+                b_dAT += tl.dot(b_kbg, b_dw_T, allow_tf32=False)
             b_dkbg = tl.dot(b_A_c, b_dw_c, allow_tf32=False).to(tl.float32)
             b_k_f = b_k.to(tl.float32)
             if USE_G:
@@ -492,8 +500,11 @@ def prepare_wy_repr_bwd_kv_npu(
             b_du_c = b_du + 0.0
             b_A_c = b_A.to(b_du.dtype) + 0.0
             b_vb = (b_v.to(tl.float32) * b_b[:, None]).to(b_v.dtype)
-            b_du_T = tl.trans(b_du)
-            b_dAT = b_dAT + tl.dot(b_vb, b_du_T, allow_tf32=False)
+            if TRANSPOSE_DA:
+                b_dAT += tl.trans(tl.dot(b_du, tl.trans(b_vb), allow_tf32=False))
+            else:
+                b_du_T = tl.trans(b_du)
+                b_dAT += tl.dot(b_vb, b_du_T, allow_tf32=False)
             b_dvb = tl.dot(b_A_c, b_du_c, allow_tf32=False).to(tl.float32)
             b_v_f = b_v.to(tl.float32)
             b_dv = b_dvb * b_b[:, None]
@@ -575,6 +586,7 @@ def prepare_wy_repr_bwd_da_dot2_npu(
     HV: tl.constexpr, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr, MASK_DMA: tl.constexpr,
     NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    g=None, G_T_CONTIG: tl.constexpr = False, FUSE_GATE: tl.constexpr = False,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
     i_bh = tl.program_id(1) + BH_OFFSET
@@ -615,6 +627,15 @@ def prepare_wy_repr_bwd_da_dot2_npu(
     b_outT = tl.dot(b_dAT, b_AT, allow_tf32=False)
     m_T = (o_i[None, :] > o_i[:, None]) & (m_t[:, None] & m_t[None, :])
     b_outT = tl.where(m_T, -b_outT, 0)
+    if FUSE_GATE:
+        if G_T_CONTIG:
+            g_ptr = _g_contig_base(g, bos, i_b, i_h, T, HV, IS_VARLEN)
+            p_g = g_ptr + row_base + o_t
+        else:
+            p_g = g + bos * HV + i_h + (row_base + o_t) * HV
+        b_g = tl.load(p_g).to(tl.float32)
+        b_prod = b_outT * exp2(b_g[None, :] - b_g[:, None])
+        b_outT = tl.where(b_prod == b_prod, b_prod, 0.0)
     if MASK_DMA:
         tl.store(p_out, b_outT.to(dA_out.dtype.element_ty), mask=m_t[:, None])
     else:
@@ -672,10 +693,11 @@ def prepare_wy_repr_bwd_da_gate_npu(
             p_g = (g + (bos * HV + i_h) + row_base * HV) + o_t * HV
         p_dA = (
             dA_out + (bos * HV + i_h) * BT + row_base * (HV * BT)
-        ) + o_t[None, :] * (HV * BT) + o_i[:, None]
+        ) + o_t[:, None] * (HV * BT) + o_i[None, :]
         b_g = tl.load(p_g).to(tl.float32)
         b_dA = tl.load(p_dA).to(tl.float32)
-        b_prod = b_dA * exp2(b_g[:, None] - b_g[None, :])
+        # Transpose the logical tile so the last DMA axis stays contiguous.
+        b_prod = b_dA * exp2(b_g[None, :] - b_g[:, None])
         b_dA = tl.where(b_prod == b_prod, b_prod, 0.0)
         tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty))
 
@@ -692,6 +714,8 @@ def prepare_wy_repr_bwd_finalize_k_npu(
     BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr, BETA_T_CONTIG: tl.constexpr, DB_T_CONTIG: tl.constexpr,
     MASK_DMA: tl.constexpr, MASK_T: tl.constexpr,
+    DIRECT_DA: tl.constexpr = False,
+    dg=None, FUSE_DG: tl.constexpr = False, DG_T_CONTIG: tl.constexpr = False,
 ):
     T_seq = T
     core_id = tl.program_id(0)
@@ -754,29 +778,40 @@ def prepare_wy_repr_bwd_finalize_k_npu(
             b_db = mload(p_db, m_t, MASK_DMA).to(tl.float32)
             b_dA = mload(p_dA, m_t[None, :], MASK_DMA).to(tl.float32)
 
+        if FUSE_DG:
+            tl.static_assert(not MASK_T and not MASK_DMA)
+            # dg consumes the FP32 derivative before dk/db convert their dot operands
+            b_dA_float = b_dA
+            b_A2 = tl.zeros((BT, BT), tl.float32)
+        # match CUDA dot operands while retaining FP32 accumulation and epilogue arithmetic
+        b_dA = b_dA.to(k.dtype.element_ty)
         for i_k in range(tl.cdiv(K, BK)):
             o_k = i_k * BK + tl.arange(0, BK)
             m_k = (o_k >= 0) & (o_k < K)
             m_p_k = m_t[:, None] & m_k[None, :]
             if MASK_T:
                 p_k = k + (bos * H + i_h // (HV // H)) * K + o_safe[:, None] * (H * K) + o_k[None, :]
-                b_k = tl.where(m_t[:, None] & m_k[None, :], tl.load(p_k, mask=m_k[None, :], other=0).to(tl.float32), 0)
+                b_k = tl.where(m_t[:, None] & m_k[None, :], tl.load(p_k, mask=m_k[None, :], other=0), 0)
             else:
                 p_k = add_token_rows(
                     k + (bos * H + i_h // (HV // H)) * K, row_base, o_t[:, None], H * K, True,
                 ) + o_k[None, :]
-                b_k = mload(p_k, m_p_k, MASK_DMA).to(tl.float32)
+                b_k = mload(p_k, m_p_k, MASK_DMA)
             if MASK_T:
                 p_dk = dk + (bos * HV + i_h) * K + o_t[:, None] * (HV * K) + o_k[None, :]
             else:
                 p_dk = add_token_rows(
                     dk + (bos * HV + i_h) * K, row_base, o_t[:, None], HV * K, True,
                 ) + o_k[None, :]
-            b_kb = b_k * b_b[:, None]
-            # lhs dot consumes its copy; the original dA stays for the rhs dot.
-            b_dA_lhs = b_dA + 0.0
+            b_kb = (b_k * b_b[:, None]).to(b_dA.dtype)
+            if DIRECT_DA:
+                # preserve the shared dot operand without introducing an arithmetic copy
+                b_dA_lhs = b_dA
+            else:
+                b_dA_lhs = (b_dA + 0.0).to(b_dA.dtype)
             b_dkb = tl.dot(b_dA_lhs, b_k, allow_tf32=False)
-            b_dk = b_dkb * b_b[:, None] + tl.trans(tl.dot(tl.trans(b_kb), b_dA, allow_tf32=False))
+            # keep both Cube outputs in token-major order to avoid transposing the larger K slab
+            b_dk = b_dkb * b_b[:, None] + tl.dot(tl.trans(b_dA), b_kb, allow_tf32=False)
             if MASK_T:
                 # Cube dots leave NaN in padded token rows. Drop them before the
                 # db reduction; a multiply would keep NaN (NaN * 0 stays NaN).
@@ -792,10 +827,24 @@ def prepare_wy_repr_bwd_finalize_k_npu(
                 b_dk += mload(p_dk, m_p_k, MASK_DMA).to(tl.float32)
             b_db += tl.sum(b_dkb * b_k, 1)
             mstore(p_dk, b_dk.to(p_dk.dtype.element_ty), m_p_k, MASK_DMA)
+            if FUSE_DG:
+                b_kf = b_k.to(tl.float32)
+                b_kc = b_kf + 0.0
+                b_A2 = tl.dot(b_kf, tl.trans(b_kc), b_A2, allow_tf32=False)
 
         if MASK_T:
             b_db = tl.where(m_t, b_db, 0)
         mstore(p_db, b_db.to(p_db.dtype.element_ty), m_t, MASK_DMA)
+        if FUSE_DG:
+            b_prod = b_dA_float * (b_A2 * b_b[:, None])
+            if DG_T_CONTIG:
+                dg_ptr = get_gate_base(dg, bos, i_b, i_h, T_seq, HV, IS_VARLEN)
+                p_dg = _t_row_ptr(dg_ptr, row_base, o_t, True, HV, True)
+            else:
+                p_dg = add_token_rows(dg + (bos * HV + i_h), row_base, o_t, HV, True)
+            b_dg = tl.load(p_dg).to(tl.float32)
+            b_dg += tl.sum(b_prod, 1) - tl.sum(b_prod, 0)
+            tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty))
 
 
 @triton.jit(do_not_specialize=['T'])
@@ -1044,10 +1093,22 @@ def prepare_wy_repr_bwd_npu(
     BK = get_wy_block_size(BT, K, PREPARE_BWD_KV_MEM_MULT, MAX_TILE_BWD_KV)
     BV = get_wy_block_size(BT, V, PREPARE_BWD_KV_MEM_MULT, MAX_TILE_BWD_KV)
     # MASK_T keeps the clamped index, the select, and a second dA. BK=128 then
-    # asks for 246272 B. Aligned launches keep BK=128.
+    # asks for 246272 B. Aligned launches permit BK=128.
     fin_max = 64 if mask_time else MAX_TILE_BWD
     BK_FIN = get_wy_block_size(BT, K, PREPARE_BWD_K_MEM_MULT, fin_max)
+    # a smaller aligned slab leaves UB space for overlapping Cube and Vector work on 950
+    pipeline_finalize_k = IS_ASCEND_950 and not mask_time and BT == 64 and K >= 128 and K % 64 == 0
+    BK_FIN_K = min(BK_FIN, 64) if pipeline_finalize_k else BK_FIN
     use_g = g is not None
+    task_num = NT * B * HV
+    fuse_finalize_dg = (
+        IS_ASCEND_950 and use_g and not is_varlen and not mask_time and BT == 64 and K_orig == K and K in (128, 256)
+        and ((K == 128 and V_orig == V == 128) or (K == 256 and H == HV))
+        and k.dtype in (torch.bfloat16, torch.float16) and BK_FIN >= 128
+        and task_num >= get_npu_properties()['num_aicore']
+    )
+    if fuse_finalize_dg:
+        BK_FIN_K = 64 if K == 128 else 128
 
     dk = k.new_empty(B, T, HV, K)
     dv = torch.empty_like(v)
@@ -1071,7 +1132,9 @@ def prepare_wy_repr_bwd_npu(
 
     mask_dma = need_dma_mask(T, BT, K, BK, V, BV, is_varlen, cu_seqlens)
     mask_fin = need_dma_mask(T, BT, K, BK_FIN, K, BK_FIN, is_varlen, cu_seqlens)
+    mask_fin_k = need_dma_mask(T, BT, K, BK_FIN_K, K, BK_FIN_K, is_varlen, cu_seqlens)
     mask_time = time_axis_needs_mask(T, BT, cu_seqlens)
+    fuse_da_gate = IS_ASCEND_950 and use_g and not is_varlen and not mask_time and BT == 64
     base = dict(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -1080,12 +1143,17 @@ def prepare_wy_repr_bwd_npu(
         IS_VARLEN=is_varlen,
     )
     core_base = dict(B=B, **base)
-    task_num = NT * B * HV
+    optimize_kv = (
+        IS_ASCEND_950 and not mask_dma and BT == 64 and K == V == 256
+        and k.dtype in (torch.bfloat16, torch.float16) and v.dtype == k.dtype
+    )
     launch_wy_core_grid(
         prepare_wy_repr_bwd_kv_npu,
         task_num=task_num,
         # Dynamic CV staging overflows A5 UB at BK=BV=256.
         disable_dynamic_cv_pipeline=True,
+        # fuse shared slab consumers to reduce Vector temporaries and Cube output backpressure
+        compile_kwargs={'hfusion_enable_multiple_consumer_fusion': True} if optimize_kv else None,
         kernel_kwargs=dict(
             k=k, v=v, beta=beta_arg, g=g_k_arg, A=A, dw=dw, du=du, dA=dA_scr,
             dk=dk, dv=dv, db=db, dg=dg_arg,
@@ -1094,6 +1162,7 @@ def prepare_wy_repr_bwd_npu(
             DG_T_CONTIG=dg_t_contig, DB_T_CONTIG=db_t_contig,
             G_EXP_PRECOMP=g_exp_precomp,
             MASK_DMA=mask_dma,
+            TRANSPOSE_DA=optimize_kv,
             **core_base,
         ),
     )
@@ -1114,10 +1183,11 @@ def prepare_wy_repr_bwd_npu(
         kernel_kwargs=dict(
             A=A, dA_mid=dA_mid, dA_out=dA_out,
             HV=HV, MASK_DMA=mask_time,
+            g=g_gate, G_T_CONTIG=g_t_contig, FUSE_GATE=fuse_da_gate,
             **base,
         ),
     )
-    if use_g:
+    if use_g and not fuse_da_gate:
         launch_wy_kernel(
             prepare_wy_repr_bwd_da_gate_npu,
             NT=NT,
@@ -1132,28 +1202,42 @@ def prepare_wy_repr_bwd_npu(
     _launch_wy_core_full_tail(
         prepare_wy_repr_bwd_finalize_k_npu,
         task_num=task_num,
-        # dynamic CV staging overflows A5 UB for masked token rows.
-        disable_dynamic_cv_pipeline=True,
+        # masked token rows retain the conservative non-pipelined UB budget
+        disable_dynamic_cv_pipeline=not pipeline_finalize_k,
+        compile_kwargs={
+            'enable_dynamic_cv_pipeline': True,
+            'hfusion_enable_multiple_consumer_fusion': True,
+        } if fuse_finalize_dg else None,
         kernel_kwargs=dict(
             k=k, beta=beta_arg, dA_out=dA_out, dk=dk, db=db,
-            H=H, HV=HV, K=K, BK=BK_FIN, BETA_T_CONTIG=beta_t_contig, DB_T_CONTIG=db_t_contig,
-            MASK_DMA=mask_fin,
+            H=H, HV=HV, K=K, BK=BK_FIN_K, BETA_T_CONTIG=beta_t_contig, DB_T_CONTIG=db_t_contig,
+            MASK_DMA=mask_fin_k,
             MASK_T=mask_time,
+            DIRECT_DA=pipeline_finalize_k,
+            dg=dg_arg,
+            FUSE_DG=fuse_finalize_dg,
+            DG_T_CONTIG=dg_t_contig,
             **core_base,
         ),
         feature_mask=need_dma_mask(
-            T, BT, K, BK_FIN, K, BK_FIN, is_varlen, cu_seqlens, time_dma=False,
+            T, BT, K, BK_FIN_K, K, BK_FIN_K, is_varlen, cu_seqlens, time_dma=False,
         ),
     )
-    if use_g:
+    if use_g and not fuse_finalize_dg:
+        # narrower FP32 Gram slabs leave more room for overlapping Cube/Vector work on 950
+        optimize_a2 = IS_ASCEND_950 and not mask_time and BT == 64 and K in (128, 256)
+        BK_A2 = min(BK_FIN, 64) if optimize_a2 else BK_FIN
+        a2_compile_kwargs = ascend_compile_kwargs()
+        if optimize_a2:
+            a2_compile_kwargs['hfusion_enable_multiple_consumer_fusion'] = True
         _launch_wy_kernel_full_tail(
             prepare_wy_repr_bwd_finalize_a2_dg_npu,
             NT=NT,
             bh_total=B * HV,
-            compile_kwargs=ascend_compile_kwargs(),
+            compile_kwargs=a2_compile_kwargs,
             kernel_kwargs=dict(
                 k=k, beta=beta_arg, dA_out=dA_out, dg=dg_arg,
-                H=H, HV=HV, K=K, BK=BK_FIN,
+                H=H, HV=HV, K=K, BK=BK_A2,
                 BETA_T_CONTIG=beta_t_contig, DG_T_CONTIG=dg_t_contig,
                 MASK_DMA=mask_fin,
                 MASK_T=mask_time,

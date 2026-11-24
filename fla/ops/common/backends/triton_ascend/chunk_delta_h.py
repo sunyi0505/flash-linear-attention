@@ -479,6 +479,9 @@ def _dhu_peak_bytes(
     # USE_G on a ragged head (two K slabs) keeps the gate scales and the where()
     # result. D96 / BV=64 asks for 221696 B (1773568 bits) against 192 KiB.
     peak = n_slabs * BK * BV * 4 + 3 * BT * BV * 4 + 512
+    if BK > 64:
+        # reserve the widened q/w staging buffers without soft UB over-admission.
+        peak += 2 * BK * BT * 4
     if partial_kv:
         peak += BK * BV * 4
     if row_select:
@@ -502,6 +505,7 @@ def _select_bwd_dhu_tiles(
     gate_inline: bool = False,
     masked: bool = False,
     use_gate: bool = False,
+    wide_k: bool = False,
 ) -> tuple[int, int]:
     """Pick (BK, BV) minimizing launch×ptr cost under a soft UB cap.
 
@@ -509,6 +513,7 @@ def _select_bwd_dhu_tiles(
     ``use_gate`` is any USE_G path. Ragged heads with two K slabs need a smaller BV.
     ``masked`` is blockdim64 DMA (varlen or unaligned T); those pad buffers are not packed.
     Ragged K/V tiles are scored against raw UB: the extra tile is not packed.
+    ``wide_k`` enables larger K slabs for aligned D128/D256 recurrences on Ascend 950.
     """
     if state_v_first:
         return 64, _get_bv(K=K, V=V)
@@ -517,8 +522,7 @@ def _select_bwd_dhu_tiles(
     inline_cap = int(ub * _DHU_UB_GATE_INLINE)
     soft_cap = int(ub * _DHU_UB_SOFT)
     masked_cap = int(ub * _DHU_UB_MASKED)
-    # bwd kernel is blockdim64: K is covered by up to four BK=64 slabs only.
-    max_bk = 64
+    max_bk = K if wide_k and K == V and K in (128, 256) and not masked and not gate_inline else 64
     desired_v = min(
         triton.next_power_of_2(V),
         max(16, triton.next_power_of_2(triton.cdiv(V, min_nv))),
@@ -536,7 +540,7 @@ def _select_bwd_dhu_tiles(
             partial = (K % bk != 0) or (V % bv != 0)
             if gate_inline:
                 cap = inline_cap
-            elif partial:
+            elif partial or bk > 64:
                 cap = ub
             elif masked:
                 cap = masked_cap
@@ -1108,6 +1112,7 @@ def chunk_gated_delta_rule_h_fwd_kernel_single_slab(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     RAGGED: tl.constexpr,
+    SKIP_UNUSED: tl.constexpr = False,
 ):
     """Update K-first states for aligned dense sequences with one K slab and host-precomputed gates."""
     core_id = tl.program_id(0)
@@ -1150,7 +1155,8 @@ def chunk_gated_delta_rule_h_fwd_kernel_single_slab(
             p_h0_1 = h0_ptr + o_i[:, None] * V + o_v[None, :]
             b_h1 += tl.load(p_h0_1).to(tl.float32)
 
-        for i_t in range(NT):
+        # the final update is dead when only chunk-entry states and residual values are requested.
+        for i_t in range(NT - (1 if SKIP_UNUSED and not STORE_FINAL_STATE else 0)):
             h_base = h_nh + tl.cast(i_t, tl.int64) * DH_CS
             o_i = tl.arange(0, BK)
             o_v = v_start + tl.arange(0, BV)
@@ -1160,7 +1166,7 @@ def chunk_gated_delta_rule_h_fwd_kernel_single_slab(
             row_base = tl.cast(i_t, tl.int64) * BT
             rows = tl.arange(0, BT)
             b_w = _dense_chunk_load(w_base, row_base, rows[:, None], o_i[None, :], T,
-                                    stride_w, BT, RAGGED).to(tl.float32)
+                                    stride_w, BT, RAGGED)
             b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
 
             if USE_G:
@@ -1189,9 +1195,26 @@ def chunk_gated_delta_rule_h_fwd_kernel_single_slab(
                     b_gk_last1 = tl.load(gk_chunk + o_k).to(tl.float32)
                 b_h1 *= b_gk_last1[:, None]
 
+            # match CUDA dot operands while retaining the fp32 recurrent state.
+            b_v = b_v.to(k.dtype.element_ty)
             b_k = _dense_chunk_load(k_base, row_base, rows[None, :], o_i[:, None], T,
-                                    stride_k, BT, RAGGED).to(tl.float32)
+                                    stride_k, BT, RAGGED)
             b_h1 = tl.dot(b_k, b_v, b_h1)
+
+        if SKIP_UNUSED and not STORE_FINAL_STATE:
+            o_i = tl.arange(0, BK)
+            o_v = v_start + tl.arange(0, BV)
+            p_h1 = h_nh + (NT - 1).to(tl.int64) * DH_CS + o_i[:, None] * V + o_v[None, :]
+            tl.store(p_h1, b_h1.to(h.dtype.element_ty))
+            if SAVE_NEW_VALUE:
+                row_base = (NT - 1).to(tl.int64) * BT
+                rows = tl.arange(0, BT)
+                b_w = _dense_chunk_load(w_base, row_base, rows[:, None], o_i[None, :], T,
+                                        stride_w, BT, RAGGED)
+                b_v_last = _dense_chunk_load(v_base, row_base, rows[:, None], o_v[None, :], T,
+                                             stride_v, BT, RAGGED).to(tl.float32) - tl.dot(b_w, b_h1.to(b_w.dtype))
+                _dense_chunk_store(v_new_base, row_base, rows[:, None], o_v[None, :],
+                                   b_v_last.to(v_new.dtype.element_ty), T, stride_v, BT, RAGGED)
 
         if STORE_FINAL_STATE:
             ht_ptr = ht + i_nh * K * V
@@ -1199,6 +1222,36 @@ def chunk_gated_delta_rule_h_fwd_kernel_single_slab(
             o_v = v_start + tl.arange(0, BV)
             p_ht1 = ht_ptr + o_i[:, None] * V + o_v[None, :]
             tl.store(p_ht1, b_h1.to(p_ht1.dtype.element_ty))
+
+
+@triton.jit(do_not_specialize=["T", "task_num", "num_core"])
+def _prepare_fwd_g_gates_kernel(
+    g, ratio, last_exp, T, task_num, num_core,
+    HV: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr,
+    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
+    g_exp=None, COMPUTE_EXP: tl.constexpr = False,
+):
+    NT = T // BT
+    NH: tl.constexpr = tl.cdiv(HV, BH)
+    rows = tl.arange(0, BT)
+    heads = tl.arange(0, BH)
+    for task in tl.range(tl.program_id(0), task_num, num_core):
+        chunk = task % NT
+        nh = task // NT
+        batch = (nh // NH).to(tl.int64)
+        head = nh % NH * BH + heads
+        tokens = chunk.to(tl.int64) * BT + rows
+        src = g + batch * S0 + tokens[:, None] * S1 + head[None, :] * S2
+        values = tl.load(src, head[None, :] < HV, other=0).to(tl.float32)
+        last = tl.load(g + batch * S0 + ((chunk + 1).to(tl.int64) * BT - 1) * S1 + head * S2,
+                       head < HV, other=0).to(tl.float32)
+        scales = exp2(last[:, None] - tl.trans(values))
+        dst = ratio + (batch * HV + head[:, None]) * T + tokens[None, :]
+        tl.store(dst, scales, head[:, None] < HV)
+        tl.store(last_exp + (batch * HV + head) * NT + chunk, exp2(last), head < HV)
+        if COMPUTE_EXP:
+            tl.store(g_exp + (batch * HV + head[:, None]) * T + tokens[None, :],
+                     exp2(tl.trans(values)), head[:, None] < HV)
 
 
 def _prepare_fwd_g_gates(
@@ -1213,6 +1266,17 @@ def _prepare_fwd_g_gates(
     """Prepare contiguous scalar gates, precomputing fp32 scales for aligned dense chunks."""
     if g is None:
         return None, None, None
+    if IS_ASCEND_950 and cu_seqlens is None and BT in (16, 32, 64) and T % BT == 0:
+        ratio = torch.empty((B, HV, T), device=g.device, dtype=torch.float32)
+        last_exp = torch.empty((B, HV, T // BT), device=g.device, dtype=torch.float32)
+        BH = min(32, triton.next_power_of_2(HV))
+        _launch_core_grid(
+            kernel=_prepare_fwd_g_gates_kernel,
+            task_num=B * triton.cdiv(HV, BH) * (T // BT),
+            kernel_kwargs=dict(g=g, ratio=ratio, last_exp=last_exp, T=T, HV=HV, BT=BT, BH=BH,
+                               S0=g.stride(0), S1=g.stride(1), S2=g.stride(2)),
+        )
+        return None, ratio, last_exp
     g_log = g.transpose(1, 2).contiguous()
     if cu_seqlens is None and (T % BT == 0):
         NT = T // BT
@@ -1266,6 +1330,16 @@ def chunk_gated_delta_rule_fwd_h_npu(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
     BT = chunk_size
+    T_orig = T
+    if (IS_ASCEND_950 and B == 1 and cu_seqlens is None and BT == 64 and T >= 4096 and T % BT
+            and T * HV >= 131072 and K == V == 128
+            and not state_v_first and g is not None and gk is None and k.element_size() == 2):
+        # zero updates and a repeated cumulative gate preserve the final partial chunk.
+        T = triton.cdiv(T, BT) * BT
+        k = _pad_dense_tail_tokens(k, T)
+        w = _pad_dense_tail_tokens(w, T)
+        u = _pad_dense_tail_tokens(u, T)
+        g = _pad_dense_tail_tokens(g, T, repeat_last=True)
     cu_seqlens_cpu = _recurrence_cu_seqlens_cpu(cu_seqlens, cu_seqlens_cpu)
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(
@@ -1348,11 +1422,16 @@ def chunk_gated_delta_rule_fwd_h_npu(
         BV=BV,
     )
     if oneslab:
+        compile_opts = dict(_FWD_H_COMPILE)
+        if (IS_ASCEND_950 and not dense_tail and BT == 64 and K >= 128
+                and k.element_size() == 2 and save_new_value and g_ratio is not None):
+            # Fuse the residual's ungated output and gated Cube operand.
+            compile_opts["hfusion_enable_multiple_consumer_fusion"] = True
         _launch_core_grid(
             kernel=chunk_gated_delta_rule_h_fwd_kernel_single_slab,
             task_num=N * HV * triton.cdiv(V, BV),
-            kernel_kwargs={**kwargs, "gk": gk, "RAGGED": dense_tail},
-            **_FWD_H_COMPILE,
+            kernel_kwargs={**kwargs, "gk": gk, "RAGGED": dense_tail, "SKIP_UNUSED": IS_ASCEND_950 and not dense_tail},
+            **compile_opts,
         )
     else:
         # Cube/Fixpipe overlap can stall the packed-tail or transposed recurrence.
@@ -1384,6 +1463,8 @@ def chunk_gated_delta_rule_fwd_h_npu(
             v_new = v_new[..., :V_orig].contiguous()
         if final_state is not None:
             final_state = final_state[..., :K_orig, :V_orig].contiguous()
+    if T_orig != T and v_new is not None:
+        v_new = v_new[:, :T_orig].contiguous()
     return h, v_new, final_state
 
 
@@ -1426,7 +1507,9 @@ def chunk_gated_delta_rule_h_bwd_kernel(
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     MASK_DMA: tl.constexpr,
+    SKIP_LAST_STATE: tl.constexpr = False,
 ):
+    tl.static_assert(not SKIP_LAST_STATE or (K <= BK and not IS_VARLEN and not MASK_DMA and not USE_INITIAL_STATE))
     core_id = tl.program_id(0)
     MASK_KV: tl.constexpr = K % BK != 0 or V % BV != 0
     T_max = T
@@ -1488,81 +1571,81 @@ def chunk_gated_delta_rule_h_bwd_kernel(
             v_start = i_v * BV
 
             if STATE_V_FIRST:
-                b_dh1 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 64:
-                    b_dh2 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 128:
-                    b_dh3 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 192:
-                    b_dh4 = tl.zeros([BV, 64], dtype=tl.float32)
+                b_dh1 = tl.zeros([BV, BK], dtype=tl.float32)
+                if K > BK:
+                    b_dh2 = tl.zeros([BV, BK], dtype=tl.float32)
+                if K > 2 * BK:
+                    b_dh3 = tl.zeros([BV, BK], dtype=tl.float32)
+                if K > 3 * BK:
+                    b_dh4 = tl.zeros([BV, BK], dtype=tl.float32)
             else:
-                b_dh1 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 64:
-                    b_dh2 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 128:
-                    b_dh3 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 192:
-                    b_dh4 = tl.zeros([64, BV], dtype=tl.float32)
+                b_dh1 = tl.zeros([BK, BV], dtype=tl.float32)
+                if K > BK:
+                    b_dh2 = tl.zeros([BK, BV], dtype=tl.float32)
+                if K > 2 * BK:
+                    b_dh3 = tl.zeros([BK, BV], dtype=tl.float32)
+                if K > 3 * BK:
+                    b_dh4 = tl.zeros([BK, BV], dtype=tl.float32)
 
             if USE_FINAL_STATE_GRADIENT:
                 dht_base = dht + i_nh * K * V
                 if STATE_V_FIRST:
                     o_v = v_start + tl.arange(0, BV)
                     m_v = (o_v >= 0) & (o_v < V)
-                    o_i = tl.arange(0, 64)
+                    o_i = tl.arange(0, BK)
                     m_i = (o_i >= 0) & (o_i < K)
                     m_p_dht1 = m_v[:, None] & m_i[None, :]
                     p_dht1 = dht_base + o_v[:, None] * K + o_i[None, :]
                 else:
-                    o_i = tl.arange(0, 64)
+                    o_i = tl.arange(0, BK)
                     m_i = (o_i >= 0) & (o_i < K)
                     o_v = v_start + tl.arange(0, BV)
                     m_v = (o_v >= 0) & (o_v < V)
                     m_p_dht1 = m_i[:, None] & m_v[None, :]
                     p_dht1 = dht_base + o_i[:, None] * V + o_v[None, :]
                 b_dh1 += mload(p_dht1, m_p_dht1, MASK_KV)
-                if K > 64:
+                if K > BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 64 + tl.arange(0, 64)
+                        o_i = BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dht2 = m_v[:, None] & m_i[None, :]
                         p_dht2 = dht_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 64 + tl.arange(0, 64)
+                        o_i = BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
                         m_p_dht2 = m_i[:, None] & m_v[None, :]
                         p_dht2 = dht_base + o_i[:, None] * V + o_v[None, :]
                     b_dh2 += mload(p_dht2, m_p_dht2, MASK_KV)
-                if K > 128:
+                if K > 2 * BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 128 + tl.arange(0, 64)
+                        o_i = 2 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dht3 = m_v[:, None] & m_i[None, :]
                         p_dht3 = dht_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 128 + tl.arange(0, 64)
+                        o_i = 2 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
                         m_p_dht3 = m_i[:, None] & m_v[None, :]
                         p_dht3 = dht_base + o_i[:, None] * V + o_v[None, :]
                     b_dh3 += mload(p_dht3, m_p_dht3, MASK_KV)
-                if K > 192:
+                if K > 3 * BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 192 + tl.arange(0, 64)
+                        o_i = 3 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dht4 = m_v[:, None] & m_i[None, :]
                         p_dht4 = dht_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 192 + tl.arange(0, 64)
+                        o_i = 3 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
@@ -1571,76 +1654,78 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                     b_dh4 += mload(p_dht4, m_p_dht4, MASK_KV)
 
             if USE_GK:
-                o_k1 = tl.arange(0, 64)
+                o_k1 = tl.arange(0, BK)
 
             DH_CS: tl.constexpr = HV * K * V
             dh_chunk = dh_base + (NT - 1).to(tl.int64) * DH_CS
 
-            for phase in tl.static_range(1 if IS_VARLEN else 2):
+            for phase in tl.static_range(1 if IS_VARLEN else (3 if SKIP_LAST_STATE else 2)):
                 if IS_VARLEN:
                     chunk_start, chunk_end = NT - 1, -1
                 elif phase == 0:
                     chunk_start, chunk_end = NT - 1, T // BT - 1
+                elif phase == 2:
+                    chunk_start, chunk_end = 0, -1
                 else:
-                    chunk_start, chunk_end = T // BT - 1, -1
+                    chunk_start, chunk_end = T // BT - 1, 0 if SKIP_LAST_STATE else -1
                 for i_t in range(chunk_start, chunk_end, -1):
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = tl.arange(0, 64)
+                        o_i = tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dh1 = m_v[:, None] & m_i[None, :]
                         p_dh1 = dh_chunk + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = tl.arange(0, 64)
+                        o_i = tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
                         m_p_dh1 = m_i[:, None] & m_v[None, :]
                         p_dh1 = dh_chunk + o_i[:, None] * V + o_v[None, :]
                     mstore(p_dh1,  b_dh1.to(p_dh1.dtype.element_ty), m_p_dh1, MASK_KV)
-                    if K > 64:
+                    if K > BK:
                         if STATE_V_FIRST:
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
-                            o_i = 64 + tl.arange(0, 64)
+                            o_i = BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             m_p_dh2 = m_v[:, None] & m_i[None, :]
                             p_dh2 = dh_chunk + o_v[:, None] * K + o_i[None, :]
                         else:
-                            o_i = 64 + tl.arange(0, 64)
+                            o_i = BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
                             m_p_dh2 = m_i[:, None] & m_v[None, :]
                             p_dh2 = dh_chunk + o_i[:, None] * V + o_v[None, :]
                         mstore(p_dh2,  b_dh2.to(p_dh2.dtype.element_ty), m_p_dh2, MASK_KV)
-                    if K > 128:
+                    if K > 2 * BK:
                         if STATE_V_FIRST:
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
-                            o_i = 128 + tl.arange(0, 64)
+                            o_i = 2 * BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             m_p_dh3 = m_v[:, None] & m_i[None, :]
                             p_dh3 = dh_chunk + o_v[:, None] * K + o_i[None, :]
                         else:
-                            o_i = 128 + tl.arange(0, 64)
+                            o_i = 2 * BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
                             m_p_dh3 = m_i[:, None] & m_v[None, :]
                             p_dh3 = dh_chunk + o_i[:, None] * V + o_v[None, :]
                         mstore(p_dh3,  b_dh3.to(p_dh3.dtype.element_ty), m_p_dh3, MASK_KV)
-                    if K > 192:
+                    if K > 3 * BK:
                         if STATE_V_FIRST:
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
-                            o_i = 192 + tl.arange(0, 64)
+                            o_i = 3 * BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             m_p_dh4 = m_v[:, None] & m_i[None, :]
                             p_dh4 = dh_chunk + o_v[:, None] * K + o_i[None, :]
                         else:
-                            o_i = 192 + tl.arange(0, 64)
+                            o_i = 3 * BK + tl.arange(0, BK)
                             m_i = (o_i >= 0) & (o_i < K)
                             o_v = v_start + tl.arange(0, BV)
                             m_v = (o_v >= 0) & (o_v < V)
@@ -1679,7 +1764,7 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                     p_do = add_token_rows(do_base, row_base, rows[:, None], stride_v, True) + o_v[None, :]
                     b_do = mload(p_do, m_p_dv, (MASK_DMA and phase == 0) or MASK_KV)
 
-                    o_i = tl.arange(0, 64)
+                    o_i = tl.arange(0, BK)
                     m_i = (o_i >= 0) & (o_i < K)
                     m_p_k = m_rows[:, None] & m_i[None, :]
                     p_k = add_token_rows(k_base, row_base, rows[:, None], stride_k, True) + o_i[None, :]
@@ -1693,14 +1778,14 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                     else:
                         b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype), allow_tf32=False)
 
-                    if K > 64:
-                        o_i_2 = 64 + tl.arange(0, 64)
+                    if K > BK:
+                        o_i_2 = BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_k = m_rows[:, None] & m_i_2[None, :]
                         p_k = add_token_rows(k_base, row_base, rows[:, None], stride_k, True) + o_i_2[None, :]
                         b_k = mload(p_k, m_p_k, (MASK_DMA and phase == 0) or MASK_KV)
                         if USE_GK:
-                            o_k2 = 64 + o_k1
+                            o_k2 = BK + o_k1
                             b_gk_last2 = mload(gk_base + last_idx * stride_w + o_k2, (o_k2 < K), K % BK != 0).to(tl.float32)
                         if STATE_V_FIRST:
                             b_dv_part = tl.dot(b_dh2.to(b_k.dtype), tl.trans(b_k), allow_tf32=False)
@@ -1708,14 +1793,14 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                         else:
                             b_dv = tl.dot(b_k, b_dh2.to(b_k.dtype), b_dv, allow_tf32=False)
 
-                    if K > 128:
-                        o_i_2 = 128 + tl.arange(0, 64)
+                    if K > 2 * BK:
+                        o_i_2 = 2 * BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_k = m_rows[:, None] & m_i_2[None, :]
                         p_k = add_token_rows(k_base, row_base, rows[:, None], stride_k, True) + o_i_2[None, :]
                         b_k = mload(p_k, m_p_k, (MASK_DMA and phase == 0) or MASK_KV)
                         if USE_GK:
-                            o_k3 = 128 + o_k1
+                            o_k3 = 2 * BK + o_k1
                             b_gk_last3 = mload(gk_base + last_idx * stride_w + o_k3, (o_k3 < K), K % BK != 0).to(tl.float32)
                         if STATE_V_FIRST:
                             b_dv_part = tl.dot(b_dh3.to(b_k.dtype), tl.trans(b_k), allow_tf32=False)
@@ -1723,14 +1808,14 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                         else:
                             b_dv = tl.dot(b_k, b_dh3.to(b_k.dtype), b_dv, allow_tf32=False)
 
-                    if K > 192:
-                        o_i_2 = 192 + tl.arange(0, 64)
+                    if K > 3 * BK:
+                        o_i_2 = 3 * BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_k = m_rows[:, None] & m_i_2[None, :]
                         p_k = add_token_rows(k_base, row_base, rows[:, None], stride_k, True) + o_i_2[None, :]
                         b_k = mload(p_k, m_p_k, (MASK_DMA and phase == 0) or MASK_KV)
                         if USE_GK:
-                            o_k4 = 192 + o_k1
+                            o_k4 = 3 * BK + o_k1
                             b_gk_last4 = mload(gk_base + last_idx * stride_w + o_k4, (o_k4 < K), K % BK != 0).to(tl.float32)
                         if STATE_V_FIRST:
                             b_dv_part = tl.dot(b_dh4.to(b_k.dtype), tl.trans(b_k), allow_tf32=False)
@@ -1757,11 +1842,11 @@ def chunk_gated_delta_rule_h_bwd_kernel(
 
                     if USE_G:
                         b_dh1 *= bg_last_exp
-                        if K > 64:
+                        if K > BK:
                             b_dh2 *= bg_last_exp
-                        if K > 128:
+                        if K > 2 * BK:
                             b_dh3 *= bg_last_exp
-                        if K > 192:
+                        if K > 3 * BK:
                             b_dh4 *= bg_last_exp
                         b_do = b_do * (b_g_exp * scale)[:, None]
                     else:
@@ -1770,33 +1855,35 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                     # Non-v-first uses do only as rhs; one buffer is enough.
                     if STATE_V_FIRST:
                         b_do_c = b_do + 0.0
-                        if K > 128:
+                        if K > 2 * BK:
                             b_do_c2 = b_do + 0.0
-                        if K > 192:
+                        if K > 3 * BK:
                             b_do_c3 = b_do + 0.0
 
-                    m_p_w = m_i[:, None] & m_rows[None, :]
-                    p_w = add_token_rows(w_base, row_base, rows[None, :], stride_w, True) + o_i[:, None]
-                    p_q = add_token_rows(q_base, row_base, rows[None, :], stride_k, True) + o_i[:, None]
-                    b_w = mload(p_w, m_p_w, (MASK_DMA and phase == 0) or MASK_KV)
-                    b_q = mload(p_q, m_p_w, (MASK_DMA and phase == 0) or MASK_KV)
-                    if USE_GK:
+                    # dh0 is unobserved without an initial state; the last dv2 is already stored.
+                    if not SKIP_LAST_STATE or phase != 2:
+                        m_p_w = m_i[:, None] & m_rows[None, :]
+                        p_w = add_token_rows(w_base, row_base, rows[None, :], stride_w, True) + o_i[:, None]
+                        p_q = add_token_rows(q_base, row_base, rows[None, :], stride_k, True) + o_i[:, None]
+                        b_w = mload(p_w, m_p_w, (MASK_DMA and phase == 0) or MASK_KV)
+                        b_q = mload(p_q, m_p_w, (MASK_DMA and phase == 0) or MASK_KV)
+                        if USE_GK:
+                            if STATE_V_FIRST:
+                                b_dh1 *= exp2(b_gk_last1)[None, :]
+                            else:
+                                b_dh1 *= exp2(b_gk_last1[:, None])
                         if STATE_V_FIRST:
-                            b_dh1 *= exp2(b_gk_last1)[None, :]
+                            b_dh1 = tl.dot(tl.trans(b_do.to(b_q.dtype)), tl.trans(b_q), b_dh1, allow_tf32=False)
+                            b_dv_i = b_dv_pristine + 0.0
+                            b_dh1 -= tl.dot(tl.trans(b_dv_i.to(b_w.dtype)), tl.trans(b_w), allow_tf32=False)
                         else:
-                            b_dh1 *= exp2(b_gk_last1[:, None])
-                    if STATE_V_FIRST:
-                        b_dh1 = tl.dot(tl.trans(b_do.to(b_q.dtype)), tl.trans(b_q), b_dh1, allow_tf32=False)
-                        b_dv_i = b_dv_pristine + 0.0
-                        b_dh1 -= tl.dot(tl.trans(b_dv_i.to(b_w.dtype)), tl.trans(b_w), allow_tf32=False)
-                    else:
-                        b_dh1 += (
-                            tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype), allow_tf32=False)
-                            - tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
-                        )
+                            b_dh1 += (
+                                tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype), allow_tf32=False)
+                                - tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
+                            )
 
-                    if K > 64:
-                        o_i_2 = 64 + tl.arange(0, 64)
+                    if K > BK:
+                        o_i_2 = BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_q = m_i_2[:, None] & m_rows[None, :]
                         p_q = add_token_rows(q_base, row_base, rows[None, :], stride_k, True) + o_i_2[:, None]
@@ -1817,8 +1904,8 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                                 b_w, b_dv.to(b_w.dtype), allow_tf32=False
                             )
 
-                    if K > 128:
-                        o_i_2 = 128 + tl.arange(0, 64)
+                    if K > 2 * BK:
+                        o_i_2 = 2 * BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_q = m_i_2[:, None] & m_rows[None, :]
                         p_q = add_token_rows(q_base, row_base, rows[None, :], stride_k, True) + o_i_2[:, None]
@@ -1839,8 +1926,8 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                                 b_w, b_dv.to(b_w.dtype), allow_tf32=False
                             )
 
-                    if K > 192:
-                        o_i_2 = 192 + tl.arange(0, 64)
+                    if K > 3 * BK:
+                        o_i_2 = 3 * BK + tl.arange(0, BK)
                         m_i_2 = (o_i_2 >= 0) & (o_i_2 < K)
                         m_p_q = m_i_2[:, None] & m_rows[None, :]
                         p_q = add_token_rows(q_base, row_base, rows[None, :], stride_k, True) + o_i_2[:, None]
@@ -1868,60 +1955,60 @@ def chunk_gated_delta_rule_h_bwd_kernel(
                 if STATE_V_FIRST:
                     o_v = v_start + tl.arange(0, BV)
                     m_v = (o_v >= 0) & (o_v < V)
-                    o_i = tl.arange(0, 64)
+                    o_i = tl.arange(0, BK)
                     m_i = (o_i >= 0) & (o_i < K)
                     m_p_dh0 = m_v[:, None] & m_i[None, :]
                     p_dh0 = dh0_base + o_v[:, None] * K + o_i[None, :]
                 else:
-                    o_i = tl.arange(0, 64)
+                    o_i = tl.arange(0, BK)
                     m_i = (o_i >= 0) & (o_i < K)
                     o_v = v_start + tl.arange(0, BV)
                     m_v = (o_v >= 0) & (o_v < V)
                     m_p_dh0 = m_i[:, None] & m_v[None, :]
                     p_dh0 = dh0_base + o_i[:, None] * V + o_v[None, :]
                 mstore(p_dh0,  b_dh1.to(p_dh0.dtype.element_ty), m_p_dh0, MASK_KV)
-                if K > 64:
+                if K > BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 64 + tl.arange(0, 64)
+                        o_i = BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dh1 = m_v[:, None] & m_i[None, :]
                         p_dh1 = dh0_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 64 + tl.arange(0, 64)
+                        o_i = BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
                         m_p_dh1 = m_i[:, None] & m_v[None, :]
                         p_dh1 = dh0_base + o_i[:, None] * V + o_v[None, :]
                     mstore(p_dh1,  b_dh2.to(p_dh1.dtype.element_ty), m_p_dh1, MASK_KV)
-                if K > 128:
+                if K > 2 * BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 128 + tl.arange(0, 64)
+                        o_i = 2 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dh2 = m_v[:, None] & m_i[None, :]
                         p_dh2 = dh0_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 128 + tl.arange(0, 64)
+                        o_i = 2 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
                         m_p_dh2 = m_i[:, None] & m_v[None, :]
                         p_dh2 = dh0_base + o_i[:, None] * V + o_v[None, :]
                     mstore(p_dh2,  b_dh3.to(p_dh2.dtype.element_ty), m_p_dh2, MASK_KV)
-                if K > 192:
+                if K > 3 * BK:
                     if STATE_V_FIRST:
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
-                        o_i = 192 + tl.arange(0, 64)
+                        o_i = 3 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         m_p_dh3 = m_v[:, None] & m_i[None, :]
                         p_dh3 = dh0_base + o_v[:, None] * K + o_i[None, :]
                     else:
-                        o_i = 192 + tl.arange(0, 64)
+                        o_i = 3 * BK + tl.arange(0, BK)
                         m_i = (o_i >= 0) & (o_i < K)
                         o_v = v_start + tl.arange(0, BV)
                         m_v = (o_v >= 0) & (o_v < V)
@@ -1942,6 +2029,18 @@ def _prepare_dhu_gate_tensors(
     """Prepare contiguous backward gates, precomputing fp32 scales for aligned dense chunks."""
     if g is None:
         return None, None, None, None, False
+    if IS_ASCEND_950 and cu_seqlens is None and BT in (16, 32, 64) and T <= 1024 and T % BT == 0:
+        ratio = torch.empty((B, HV, T), device=g.device, dtype=torch.float32)
+        g_exp = torch.empty_like(ratio)
+        last_exp = torch.empty((B, HV, T // BT), device=g.device, dtype=torch.float32)
+        BH = min(32, triton.next_power_of_2(HV))
+        _launch_core_grid(
+            kernel=_prepare_fwd_g_gates_kernel,
+            task_num=B * triton.cdiv(HV, BH) * (T // BT),
+            kernel_kwargs=dict(g=g, ratio=ratio, last_exp=last_exp, T=T, HV=HV, BT=BT, BH=BH,
+                               S0=g.stride(0), S1=g.stride(1), S2=g.stride(2), g_exp=g_exp, COMPUTE_EXP=True),
+        )
+        return None, g_exp, ratio, last_exp, True
     g_log = g.transpose(1, 2).contiguous()
     if cu_seqlens is None and (T % BT == 0):
         NT = T // BT
@@ -1988,6 +2087,18 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
         N, NT = len(cu_seqlens) - 1, len(chunk_indices)
         if chunk_offsets is None:
             chunk_offsets = prepare_chunk_offsets(cu_seqlens=cu_seqlens, chunk_size=BT)
+
+    T_orig = T
+    if (IS_ASCEND_950 and cu_seqlens is None and T % BT and K == V == 128
+            and not state_v_first and g is not None and gk is None):
+        # masked inline gates overflow UB even at BV=16; padding enables the aligned precomputed-gate path.
+        T = triton.cdiv(T, BT) * BT
+        q = _pad_dense_tail_tokens(q, T)
+        k = _pad_dense_tail_tokens(k, T)
+        w = _pad_dense_tail_tokens(w, T)
+        do = _pad_dense_tail_tokens(do, T)
+        dv = _pad_dense_tail_tokens(dv, T)
+        g = _pad_dense_tail_tokens(g, T, repeat_last=True)
 
     # Ragged K/V forces a partial slab. The selector then caps BV, and the
     # masked image still overflows (D=100 / two slabs). Pad onto the power-of-two
@@ -2036,6 +2147,12 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
     gate_inline = g is not None and not use_g_precomp
     masked = time_axis_needs_mask(T, BT, cu_seqlens, cu_seqlens_cpu)
     min_nv = triton.cdiv(get_npu_properties()["num_aicore"], N * HV)
+    wide_k = IS_ASCEND_950 and BT == 64 and gk is None and cu_seqlens is None
+    if wide_k and K == V == 128 and not masked and q.element_size() == 2:
+        # avoid a second task wave just to fill the remaining Cube cores.
+        min_nv = max(1, get_npu_properties()["num_aicore"] // (N * HV))
+    elif K == 128:
+        wide_k = False
     BK, BV = _select_bwd_dhu_tiles(
         K=K,
         V=V,
@@ -2044,6 +2161,7 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
         gate_inline=gate_inline,
         masked=masked,
         use_gate=g is not None,
+        wide_k=wide_k,
     )
     _launch_core_grid(
         kernel=chunk_gated_delta_rule_h_bwd_kernel,
@@ -2085,6 +2203,8 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
             "MASK_DMA": need_dma_mask(
                 T, BT, K, BK, V, BV, cu_seqlens is not None, cu_seqlens, cu_seqlens_cpu,
             ),
+            "SKIP_LAST_STATE": IS_ASCEND_950 and BK == K == 256 and BT == 64 and not masked
+            and h0 is None and gk is None and cu_seqlens is None,
         },
     )
     if K_orig != K or V_orig != V:
@@ -2097,4 +2217,6 @@ def chunk_gated_delta_rule_bwd_dhu_npu(
             if dh0 is not None:
                 dh0 = dh0[..., :K_orig, :V_orig].contiguous()
         dv2 = dv2[..., :V_orig].contiguous()
+    if T_orig != T:
+        dv2 = dv2[:, :T_orig].contiguous()
     return dh, dh0, dv2

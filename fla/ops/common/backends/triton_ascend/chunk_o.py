@@ -30,10 +30,12 @@ from fla.utils.ascend_ub_manager import (
     ASCEND_LAUNCH_BLOCK_BUDGET,
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
+    compute_ub_block_size,
     get_npu_properties,
     launch_grid_chunked,
     max_grid_axis_chunks,
 )
+from fla.utils.hardware import IS_ASCEND_950
 
 _BC_CANDIDATES = (32, 16)
 _O_MEM_MULT = 6.0
@@ -144,31 +146,14 @@ def _get_dqkwg_full_tiles(BT: int, K: int, V: int, use_dw: bool) -> tuple[int, i
     return None
 
 
-_HDH_BK_CANDIDATES = (256, 128, 64, 32, 16)
-_HDH_BV_CANDIDATES = (256, 128, 64, 32, 16)
-
-
-def _get_hdh_tiles(K: int, V: int) -> tuple[int, int]:
-    """Tiles for the Vector-only Frobenius <h, dh> kernel.
-
-    A 64-wide tile compiles for head dims <= 64. Wider heads lower the
-    fp32 reduction through a cube workspace and overflow UB unless both
-    tiles stay at 32.
-    """
-    ub_budget = int(_UB_BYTES * _SAFETY_MARGIN)
-    dim_cap = 32 if max(K, V) > 64 else 64
-    k_cap = min(dim_cap, triton.next_power_of_2(K))
-    v_cap = min(dim_cap, triton.next_power_of_2(V))
-    for BK in _HDH_BK_CANDIDATES:
-        if k_cap < BK:
-            continue
-        for BV in _HDH_BV_CANDIDATES:
-            if v_cap < BV:
-                continue
-            peak = 2 * BK * BV * 2 + BK * BV * 4 + BK * 4
-            if peak <= ub_budget:
-                return BK, BV
-    return 16, 16
+def _get_hdh_block_size(K: int, V: int) -> int:
+    return compute_ub_block_size(
+        dim_size=K * V,
+        memory_multiplier=4.0,
+        safety_margin=_SAFETY_MARGIN,
+        fallback=2048,
+        max_block=8192,
+    )
 
 
 def _varlen_chunk_passes(cu_seqlens, chunk_indices, chunk_size):
@@ -353,6 +338,46 @@ def chunk_o_fwd_kernel(
         mstore(p_o, b_o.to(p_o.dtype.element_ty), m_p_v, MASK_DMA)
 
 
+@triton.jit(do_not_specialize=['T', 'scale', 'task_num', 'num_core'])
+def chunk_o_fwd_kernel_grouped(
+    q, k, v, h, g, o, T, scale, task_num, num_core,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+):
+    tl.static_assert(BK == K and BV == V and HV == 3 * H)
+    NT = T // BT
+    rows = tl.arange(0, BT)
+    cols = tl.arange(0, BK)
+    values = tl.arange(0, BV)
+    for task in tl.range(tl.program_id(0), task_num, num_core):
+        i_b = (task // (H * NT)).to(tl.int64)
+        i_h = (task // NT % H).to(tl.int64)
+        i_t = (task % NT).to(tl.int64)
+        token = i_t * BT + rows
+        q_base = q + ((i_b * T + token[:, None]) * H + i_h) * K
+        k_base = k + ((i_b * T + token[None, :]) * H + i_h) * K
+        b_q = tl.load(q_base + cols[None, :])
+        b_k = tl.load(k_base + cols[:, None])
+        b_raw = tl.dot(b_q, b_k)
+        # preserve the shared score across destructive dot operands.
+        b_raw_keep = b_raw + 0.0
+        for group_head in tl.range(0, 3, loop_unroll_factor=1):
+            head = i_h * 3 + group_head
+            b_g = tl.load(g + (i_b * HV + head) * T + token)
+            b_a = b_raw_keep * exp2(b_g[:, None] - b_g[None, :])
+            b_a = tl.where(rows[:, None] >= rows[None, :], b_a, 0).to(v.dtype.element_ty)
+            # reload q because Ascend dot clobbers its lhs.
+            b_q = tl.load(q_base + cols[None, :])
+            p_h = h + ((i_b * NT + i_t) * HV + head) * K * V + cols[:, None] * V + values[None, :]
+            b_h = tl.load(p_h)
+            b_o = tl.dot(b_q, b_h) * exp2(b_g)[:, None]
+            p_v = v + ((i_b * T + token[:, None]) * HV + head) * V + values[None, :]
+            b_v = tl.load(p_v)
+            b_o = b_o * scale + tl.dot(b_a, b_v) * scale
+            p_o = o + ((i_b * T + token[:, None]) * HV + head) * V + values[None, :]
+            tl.store(p_o, b_o.to(o.dtype.element_ty))
+
+
 @register(chunk_fwd_o, backend=TritonAscendBackend)
 @input_guard
 def chunk_fwd_o_npu(
@@ -392,7 +417,7 @@ def chunk_fwd_o_npu(
     # Partial K/V makes every autotuned BK=128 load masked. That image overflows
     # the 192KiB UB (D=100 asks for 280960 B). Pad onto the power-of-two tile the
     # aligned kernel already compiles, then slice the output back.
-    V_orig = V
+    K_orig, V_orig = K, V
     if cu_seqlens is None and T % BT == 0:
         k_pad = triton.next_power_of_2(K)
         v_pad = triton.next_power_of_2(V)
@@ -428,12 +453,50 @@ def chunk_fwd_o_npu(
     BV = 128 if V % 128 == 0 else min(128, triton.next_power_of_2(V))
     while BV > 16 and V % BV != 0:
         BV //= 2
-    NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()["num_aicore"]
     # Autotuning BK=128 on masked varlen tiles overflows UB (~280 KiB). Pick tiles like bwd.
     BK = _get_bk(K=K, BC=BT)
+    full_state_tile = (
+        IS_ASCEND_950
+        and q.dtype == torch.bfloat16
+        and BT == 64
+        and (K == V == 256 or (K_orig == V_orig == K == V == 128 and HV == 3 * H))
+        and cu_seqlens is None
+        and T % BT == 0
+        and HV * total_chunks >= num_core
+        and not state_v_first
+        and g_gamma is None
+    )
+    if full_state_tile:
+        # native 950 lowering fits the full state tile, avoiding repeated QK and narrow DMA transfers.
+        BK, BV = K, V
+    NV = triton.cdiv(V, BV)
     if g is not None:
         g = g.transpose(1, 2).contiguous()
+    if full_state_tile and K == 128 and g is not None and H * total_chunks >= num_core:
+        chunk_o_fwd_kernel_grouped[(num_core,)](
+            q=q,
+            k=k,
+            v=v,
+            h=h,
+            g=g,
+            o=o,
+            T=T,
+            scale=scale,
+            task_num=H * total_chunks,
+            num_core=num_core,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            enable_ubuf_saving=True,
+            unit_flag=True,
+            **ascend_compile_kwargs(),
+        )
+        return o[..., :V_orig].contiguous() if V_orig != V else o
     for pass_indices, time_tail in passes:
         pass_total_chunks = len(pass_indices) if cu_seqlens is not None else total_chunks
         pass_task_num = NV * HV * pass_total_chunks
@@ -1314,12 +1377,9 @@ def chunk_dg_bwd_kernel_hdh(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+    BLOCK: tl.constexpr,
     G_T_CONTIG: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    MASK_DMA: tl.constexpr,
 ):
     """Compute the final-token gate contribution from h and dh on vector cores.
 
@@ -1354,32 +1414,15 @@ def chunk_dg_bwd_kernel_hdh(
             g_base = g + bos * HV + i_h
             b_g_last = tl.load(g_base + tl.cast(last_idx, tl.int64) * HV).to(tl.float32)
 
-        acc = 0.0
-        for i_k in range(tl.cdiv(K, BK)):
-            for i_v in range(tl.cdiv(V, BV)):
-                if STATE_V_FIRST:
-                    o_v = i_v * BV + tl.arange(0, BV)
-                    m_v = (o_v >= 0) & (o_v < V)
-                    o_k = i_k * BK + tl.arange(0, BK)
-                    m_k = (o_k >= 0) & (o_k < K)
-                    m_p_h = m_v[:, None] & m_k[None, :]
-                    p_h = h_ptr + o_v[:, None] * K + o_k[None, :]
-                    p_dh = dh_ptr + o_v[:, None] * K + o_k[None, :]
-                else:
-                    o_v = i_v * BV + tl.arange(0, BV)
-                    m_v = (o_v >= 0) & (o_v < V)
-                    o_k = i_k * BK + tl.arange(0, BK)
-                    m_k = (o_k >= 0) & (o_k < K)
-                    # Sum is layout-invariant; load the V-contiguous [BK, BV] tile.
-                    m_p_h = m_k[:, None] & m_v[None, :]
-                    p_h = h_ptr + o_k[:, None] * V + o_v[None, :]
-                    p_dh = dh_ptr + o_k[:, None] * V + o_v[None, :]
-                b_h = mload(p_h, m_p_h, MASK_DMA).to(tl.float32)
-                b_dh = mload(p_dh, m_p_h, MASK_DMA).to(tl.float32)
-                if MASK_DMA:
-                    b_h = tl.where(m_p_h, b_h, 0)
-                    b_dh = tl.where(m_p_h, b_dh, 0)
-                acc += tl.sum(b_h * b_dh)
+        # both state layouts are contiguous; the Frobenius product needs no row boundaries.
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for block in range(tl.cdiv(K * V, BLOCK)):
+            offsets = block * BLOCK + tl.arange(0, BLOCK)
+            b_h = tl.load(h_ptr + offsets, offsets < K * V, other=0).to(tl.float32)
+            b_dh = tl.load(dh_ptr + offsets, offsets < K * V, other=0).to(tl.float32)
+            acc += b_h * b_dh
+        # reduce once per state to avoid a vector-to-scalar synchronization per block.
+        acc = tl.sum(acc, 0)
 
         dg_ptr = dg + bos * HV + i_h
         p_last = dg_ptr + tl.cast(last_idx, tl.int64) * HV
@@ -1710,6 +1753,45 @@ def chunk_bwd_dqkwg_npu(
     if scale is None:
         scale = K ** -0.5
     scale = float(scale)
+    if (
+        IS_ASCEND_950
+        and B == 1
+        and BT == 64
+        and K == V == 128
+        and cu_seqlens is None
+        and T >= 4096
+        and T * HV >= 131072
+        and T % BT
+        and g is not None
+        and g_gamma is None
+        and not state_v_first
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype == do.dtype == h.dtype == dh.dtype
+        and (w is None or dv.dtype == q.dtype)
+    ):
+        T_pad = triton.cdiv(T, BT) * BT
+        dq, dk, dw, dg = chunk_bwd_dqkwg_npu(
+            q=_pad_dense_tail_tokens(q, T_pad),
+            k=_pad_dense_tail_tokens(k, T_pad),
+            v=_pad_dense_tail_tokens(v, T_pad),
+            do=_pad_dense_tail_tokens(do, T_pad),
+            h=h,
+            dh=dh,
+            w=_pad_dense_tail_tokens(w, T_pad),
+            g=_pad_dense_tail_tokens(g, T_pad, repeat_last=True),
+            dv=_pad_dense_tail_tokens(dv, T_pad),
+            scale=scale,
+            chunk_size=BT,
+            chunk_indices=chunk_indices,
+        )
+        # repeated cumulative gates share the real final token's state-update gradient.
+        dg[:, T - 1] += dg[:, T:].sum(dim=1)
+        return (
+            dq[:, :T].contiguous(),
+            dk[:, :T].contiguous(),
+            dw[:, :T].contiguous() if dw is not None else None,
+            dg[:, :T].contiguous(),
+        )
     # Same pad as dv_local: a ragged head would mask the BK/BV already chosen
     # for the aligned power-of-two case. Slice dq/dk/dw back after the launch.
     K_orig = K
@@ -1742,6 +1824,7 @@ def chunk_bwd_dqkwg_npu(
     if masked_launch and max(K, V) > 64 and full_tiles is not None:
         full_tiles = min(full_tiles[0], 32), min(full_tiles[1], 32)
     use_full = full_tiles is not None and (g is not None or g_gamma is not None)
+    full_compile_opts = {}
     if use_full:
         BK, BV = full_tiles
         # gamma and masked loads keep extra buffers beyond the unmasked scalar-gate estimate.
@@ -1749,6 +1832,28 @@ def chunk_bwd_dqkwg_npu(
             BK, BV = min(BK, 32), min(BV, 32)
         elif need_dma_mask(T, BT, K, BK, V, BV, cu_seqlens is not None, cu_seqlens):
             BV = min(BV, 32)
+        elif (
+            IS_ASCEND_950
+            and BT == 64
+            and K in (128, 256)
+            and V == K
+            and cu_seqlens is None
+            and g is not None
+            and not state_v_first
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q.dtype == k.dtype == v.dtype == do.dtype == h.dtype == dh.dtype
+            and (not use_dw or dv.dtype == q.dtype)
+        ):
+            # Native 950 lowering keeps dot accumulators outside UB; wider tiles reduce repeated DMA and Fixpipe work.
+            BK, BV = 128, 128
+            # fp16 epilogue lowering can exceed UB with a 256-wide tile.
+            if K == 256 and use_dw and q.dtype == torch.bfloat16:
+                from triton.backends.ascend.compiler import NPUOptions
+
+                if 'multibuffer_mode' in NPUOptions.__dataclass_fields__:
+                    # single-buffer L1/UB operands and L0C accumulators for the full 256x256 state tile.
+                    BK, BV = 256, 256
+                    full_compile_opts['multibuffer_mode'] = {'gm': 2, 'l1': 1, 'l0c': 1, 'ub': 1}
         dqkwg_kernel = chunk_dqkwg_bwd_kernel_full
     else:
         BC = _get_bc(BT=BT, K=K, V=V)
@@ -1803,7 +1908,7 @@ def chunk_bwd_dqkwg_npu(
         dqkwg_kwargs['dg'] = dg if dg is not None else dq
         dqkwg_kwargs['B'] = B
         num_core = get_npu_properties()["num_aicore"]
-        compile_opts = ascend_compile_kwargs()
+        compile_opts = {**ascend_compile_kwargs(), **full_compile_opts}
         workspace_opts = {k: v for k, v in compile_opts.items() if k != 'multibuffer'}
         if cu_seqlens is not None:
             dqkwg_kwargs['chunk_offsets'] = prepare_chunk_offsets(cu_seqlens, BT)
@@ -1883,7 +1988,7 @@ def chunk_bwd_dqkwg_npu(
     if dg is not None:
         dg = dg.sum(0)
         if use_full:
-            hdh_bk, hdh_bv = _get_hdh_tiles(K=K, V=V)
+            hdh_block = _get_hdh_block_size(K=K, V=V)
             num_vec = get_npu_properties()["num_vectorcore"]
             chunk_dg_bwd_kernel_hdh[(num_vec,)](
                 h=h,
@@ -1900,12 +2005,9 @@ def chunk_bwd_dqkwg_npu(
                 K=K,
                 V=V,
                 BT=BT,
-                BK=hdh_bk,
-                BV=hdh_bv,
+                BLOCK=hdh_block,
                 G_T_CONTIG=g_t_contig,
-                STATE_V_FIRST=state_v_first,
                 IS_VARLEN=cu_seqlens is not None,
-                MASK_DMA=need_dma_mask(T, BT, K, hdh_bk, V, hdh_bv, cu_seqlens is not None, cu_seqlens),
             )
     if K_orig != K:
         dq = dq[..., :K_orig].contiguous()

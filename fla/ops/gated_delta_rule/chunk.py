@@ -28,6 +28,7 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils.hardware import IS_ASCEND_950
 
 
 def chunk_gated_delta_rule_fwd(
@@ -280,8 +281,48 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_size: int = 64,
         return_intermediate_states: bool = False,
     ):
+        ctx.original_T = None
         q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:
+        original_T = q.shape[1] if IS_ASCEND_950 and chunk_size == 64 else 0
+        if (
+            IS_ASCEND_950
+            and chunk_size == 64
+            and original_T >= 512
+            and original_T % chunk_size != 0
+            and q.device.type == 'npu'
+            and q.ndim == k.ndim == v.ndim == 4
+            and q.shape[0] == 1
+            and q.shape[:2] == k.shape[:2] == v.shape[:2]
+            and cu_seqlens is None
+            and cp_context is None
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 128
+            and q.dtype == k.dtype == v.dtype
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and g is not None
+            and beta is not None
+            and g.shape == beta.shape == v.shape[:3]
+            and not use_gate_in_kernel
+            and not use_beta_sigmoid_in_kernel
+            and not state_v_first
+            and not return_intermediate_states
+        ):
+            ctx.original_T = original_T
+            pad_t = chunk_size - original_T % chunk_size
+            if original_T <= 1024 and q.shape[2] == k.shape[2] == v.shape[2]:
+                from fla.ops.gated_delta_rule.backends.triton_ascend.input import prepare_padded_inputs
+
+                q, k, v, g, beta, q_rstd, k_rstd = prepare_padded_inputs(
+                    q, k, v, g, beta, original_T + pad_t, use_qk_l2norm_in_kernel,
+                )
+            else:
+                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_t))
+                k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_t))
+                v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_t))
+                # zero log-gate increments keep the cumulative gate constant through the padded tail.
+                g = torch.nn.functional.pad(g, (0, 0, 0, pad_t))
+                beta = torch.nn.functional.pad(beta, (0, 0, 0, pad_t))
+
+        if use_qk_l2norm_in_kernel and q_rstd is None:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
@@ -337,6 +378,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.cp_context = cp_context
         ctx.state_v_first = state_v_first
         ctx.use_gate_in_kernel = use_gate_in_kernel
+        if ctx.original_T is not None:
+            o = o[:, :ctx.original_T]
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -364,6 +407,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             A_log,
             dt_bias,
         ) = ctx.saved_tensors
+        if ctx.original_T is not None:
+            do = torch.nn.functional.pad(do, (0, 0, 0, 0, 0, q.shape[1] - ctx.original_T))
         dq, dk, dv, db, dg, dh0, dA_log, ddt_bias = chunk_gated_delta_rule_bwd(
             q=q,
             k=k,
@@ -390,6 +435,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
         if ctx.use_beta_sigmoid_in_kernel:
             db = fused_beta_sigmoid_bwd(beta_raw, db, scale=2.0 if ctx.allow_neg_eigval else 1.0)
+        if ctx.original_T is not None:
+            # padding inside forward is not autograd-tracked; return gradients with the original input shapes.
+            dq, dk, dv, dg, db = (dx[:, :ctx.original_T] for dx in (dq, dk, dv, dg, db))
         return (
             dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta_raw),
             None, dh0, None, None, None, None, None, None, None, dA_log, ddt_bias,

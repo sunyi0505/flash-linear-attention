@@ -17,6 +17,7 @@ from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
     compute_ub_block_size,
+    get_ub_manager,
     iter_axis_launch_chunks,
 )
 
@@ -180,5 +181,8 @@ def l2norm_bwd_npu(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor, eps: f
     assert rstd.numel() == T
 
     BD, BT = _get_l2norm_tiles(D=D, is_forward=False)
+    # smaller row tiles reduce vector-function register pressure in the lowp VJP on Ascend 950.
+    if y.dtype == torch.bfloat16 and D == 256 and get_ub_manager().npu_model.startswith('Ascend950'):
+        BT = min(BT, 16)
     _launch_l2norm_bwd_kernel(y=y, rstd=rstd, dy=dy, dx=dx, T=T, D=D, BD=BD, BT=BT)
     return dx.view(y_shape_og)

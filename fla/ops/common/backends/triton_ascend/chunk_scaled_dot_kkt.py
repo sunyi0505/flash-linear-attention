@@ -20,6 +20,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
 from fla.utils import input_guard
 from fla.utils.ascend_ub_manager import compute_row_tile_block_size, get_npu_properties
+from fla.utils.hardware import IS_ASCEND_950
 
 # peak live fp32 tiles: b_A[BT,BT], b_k[BT,BK], tl.dot buffer; post-dot gate[BT,BT]
 _CHUNK_SCALED_DOT_KKT_MEM_MULT = 4.0
@@ -28,8 +29,10 @@ _FALLBACK_BK = 16
 _MAX_BK_FWD = 128
 
 
-def _get_fwd_bk(BT: int, K: int) -> int:
+def _get_fwd_bk(BT: int, K: int, dtype: torch.dtype) -> int:
     """UB-safe BK tile size for chunk_scaled_dot_kkt_fwd on NPU."""
+    # smaller tiles improve overlap for converted fp16/bf16 inputs; fp32 inputs favor larger tiles.
+    max_bk = 32 if IS_ASCEND_950 and BT == 64 and K == 256 and dtype != torch.float32 else _MAX_BK_FWD
     return compute_row_tile_block_size(
         row_dim=BT,
         fixed_dim=K,
@@ -39,7 +42,7 @@ def _get_fwd_bk(BT: int, K: int) -> int:
         dtype_size=4,
         fallback=_FALLBACK_BK,
         min_block=16,
-        max_block=min(_MAX_BK_FWD, triton.next_power_of_2(K)),
+        max_block=min(max_bk, triton.next_power_of_2(K)),
     )
 
 
@@ -67,6 +70,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
     MASK_DMA: tl.constexpr,
+    GROUP_SIZE: tl.constexpr = 1,
 ):
     T = T.to(tl.int64)
     bt_stride = B.to(tl.int64) * T
@@ -75,10 +79,11 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     m_causal = o_i[:, None] > o_i[None, :]
 
     for task_id in tl.range(core_id, task_num, num_core):
-        bh = B.to(tl.int64) * HV
+        bh = B.to(tl.int64) * (HV // GROUP_SIZE)
         i_t = task_id.to(tl.int64) // bh
         i_bh = task_id.to(tl.int64) % bh
-        i_b, i_h = i_bh // HV, i_bh % HV
+        i_b = i_bh // (HV // GROUP_SIZE)
+        i_h = (i_bh % (HV // GROUP_SIZE)) * GROUP_SIZE
         if IS_VARLEN:
             i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
             bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
@@ -90,14 +95,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         m_A = m_causal & (m_t[:, None] & m_t)
         # 1-token chunks: strictly-lower-tri kkt is 0.
         if tl.cast(i_t, tl.int64) * BT + 1 < T:
-            p_b = beta + i_h * bt_stride + bos + o_t
-            b_b = mload(p_b, m_t, MASK_DMA).to(tl.float32)
-
-            if USE_G:
-                p_g = g + i_h * bt_stride + bos + o_t
-                b_g = mload(p_g, m_t, MASK_DMA).to(tl.float32)
-
-            b_A = tl.zeros([BT, BT], dtype=tl.float32)
+            b_gram = tl.zeros([BT, BT], dtype=tl.float32)
             for i_k in range(tl.cdiv(K, BK)):
                 o_k = i_k * BK + tl.arange(0, BK)
                 m_k = (o_k >= 0) & (o_k < K)
@@ -106,17 +104,24 @@ def chunk_scaled_dot_kkt_fwd_kernel(
                 b_k = mload(p_k, m_p_k, MASK_DMA).to(tl.float32)
                 # ascend tl.dot may clobber lhs; keep rhs on the original tile.
                 b_k_lhs = b_k + 0.0
-                b_A = tl.dot(b_k_lhs, tl.trans(b_k), b_A, allow_tf32=False)
+                b_gram = tl.dot(b_k_lhs, tl.trans(b_k), b_gram, allow_tf32=False)
 
-            if USE_G:
-                # mask first so upper-triangle g_i-g_j cannot overflow to inf.
-                b_g_diff = tl.where(m_A, b_g[:, None] - b_g[None, :], 0)
-                b_A *= exp2(b_g_diff)
-            b_A *= b_b[:, None]
-            b_A = tl.where(m_A, b_A, 0)
-
-            p_A = A + (bos * HV + i_h) * BT + o_t[:, None] * (BT * HV) + o_i[None, :]
-            mstore(p_A, b_A.to(p_A.dtype.element_ty), m_t[:, None], MASK_DMA)
+            # Only the raw Gram is shared; each value head retains its own gates.
+            for group_head in range(GROUP_SIZE):
+                i_hv = i_h + group_head
+                p_b = beta + i_hv * bt_stride + bos + o_t
+                b_b = mload(p_b, m_t, MASK_DMA).to(tl.float32)
+                if USE_G:
+                    p_g = g + i_hv * bt_stride + bos + o_t
+                    b_g = mload(p_g, m_t, MASK_DMA).to(tl.float32)
+                    # Mask before exp2 to avoid overflowing the unused triangle.
+                    b_g_diff = tl.where(m_A, b_g[:, None] - b_g[None, :], 0)
+                    b_A = b_gram * exp2(b_g_diff)
+                else:
+                    b_A = b_gram
+                b_A = tl.where(m_A, b_A * b_b[:, None], 0)
+                p_A = A + (bos * HV + i_hv) * BT + o_t[:, None] * (BT * HV) + o_i[None, :]
+                mstore(p_A, b_A.to(p_A.dtype.element_ty), m_t[:, None], MASK_DMA)
 
 
 def chunk_scaled_dot_kkt_fwd_verifier(
@@ -180,7 +185,14 @@ def chunk_scaled_dot_kkt_fwd_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens=cu_seqlens, chunk_size=BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.zeros(B, T, HV, BT, device=k.device, dtype=output_dtype)
-    BK = _get_fwd_bk(BT=BT, K=K)
+    BK = _get_fwd_bk(BT=BT, K=K, dtype=k.dtype)
+    group_size = 1
+    if (
+        IS_ASCEND_950 and HV in (2 * H, 3 * H, 4 * H, 8 * H, 16 * H) and K == 128 and BT == 64
+        and cu_seqlens is None and T % BT == 0 and k.element_size() == 2
+    ):
+        # cap reuse at four heads to retain task parallelism for larger GVA ratios.
+        group_size = min(HV // H, 4)
 
     num_core = get_npu_properties()['num_aicore']
     g_arg = torch.permute(g, (2, 0, 1)).contiguous() if g is not None else g
@@ -194,13 +206,14 @@ def chunk_scaled_dot_kkt_fwd_npu(
         chunk_indices=chunk_indices,
         T=T,
         B=B,
-        task_num=NT * B * HV,
+        task_num=NT * B * HV // group_size,
         num_core=num_core,
         H=H,
         HV=HV,
         K=K,
         BT=BT,
         BK=BK,
+        GROUP_SIZE=group_size,
         MASK_DMA=need_dma_mask(T, BT, K, BK, K, BK, cu_seqlens is not None, cu_seqlens),
     )
     return A

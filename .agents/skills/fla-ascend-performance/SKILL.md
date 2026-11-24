@@ -41,6 +41,7 @@ Use the [diagnosis table](references/reference.md#diagnosis) to choose the next 
 - Preserve numerical precision, optional inputs, and fixed/variable-length behavior. Verify tail handling and pointer arithmetic before increasing tiles or fusing stages.
 - Omit `num_warps` and `num_stages` from Ascend launches and autotune settings; these are unsupported on this backend.
 - Check [compiler and memory traps](references/TRAPS.md) when changing DMA paths, pointer arithmetic, or reused `tl.dot` operands. Use [contiguous gate loading](references/g-contiguous-loading.md) when gate loads along time are strided.
+- Use [SIMD/SIMT hybrid optimization](references/simd-simt-optimization.md) when investigating random GM reads from small inputs or long SIMD compare/mask/select sequences. Verify target hardware and compiler support before applying Ascend C examples to Triton.
 
 [Kernel cases](references/cases.md) explain existing convolution, recurrence, and solve implementations. Their tile choices are workload-specific examples.
 
